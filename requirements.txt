@@ -22,4 +22,4 @@ numpy<2.0
 protobuf==3.20.3
 
 # Add this to your requirements.txt
-#PyAudio==0.2.11
+PyAudio==0.2.11

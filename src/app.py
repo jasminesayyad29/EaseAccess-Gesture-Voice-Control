@@ -14,14 +14,12 @@ class ChatBot:
         return ChatBot.userinputQueue.get()
 
     def close_callback(route, websockets):
-        # if not websockets:
-        #     print('Bye!')
         exit()
 
     @eel.expose
     def getUserInput(msg):
         ChatBot.userinputQueue.put(msg)
-        print(msg)
+        print(f"User input: {msg}")
     
     def close():
         ChatBot.started = False
@@ -47,10 +45,13 @@ class ChatBot:
             ChatBot.started = True
             while ChatBot.started:
                 try:
-                    eel.sleep(10.0)
+                    eel.sleep(1.0)  # Reduced sleep time for better responsiveness
                 except:
-                    #main thread exited
                     break
         
-        except:
-            pass
+        except Exception as e:
+            print(f"Eel start error: {e}")
+
+# Initialize on import
+if __name__ == "__main__":
+    ChatBot.start()
