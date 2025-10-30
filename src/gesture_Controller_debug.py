@@ -35,6 +35,9 @@ class Gest(IntEnum):
     TWO_FINGER_CLOSED = 34
     PINCH_MAJOR = 35
     PINCH_MINOR = 36
+    SLIDE_NEXT = 37
+    SLIDE_PREV = 38
+    ZOOM = 39
 
 class HLabel(IntEnum):
     MINOR = 0
@@ -124,6 +127,48 @@ class HandRecog:
         if self.frame_count > 4 :
             self.ori_gesture = current_gesture
         return self.ori_gesture
+    
+    def perform_presentation_action(self):
+    
+        if self.hand_result is None:
+            return
+
+        # Get landmark references for thumb and index
+        thumb_tip = self.hand_result.landmark[4]
+        thumb_ip = self.hand_result.landmark[3]
+        index_tip = self.hand_result.landmark[8]
+        wrist = self.hand_result.landmark[0]
+
+        # 1️⃣ Next Slide (Thumb pointing right)
+        if (thumb_tip.x > thumb_ip.x) and self.finger == Gest.THUMB:
+            pyautogui.press('right')
+            print("Next Slide")
+            time.sleep(0.7)  # small delay to avoid multiple triggers
+
+        # 2️⃣ Previous Slide (Thumb pointing left)
+        elif (thumb_tip.x < thumb_ip.x) and self.finger == Gest.THUMB:
+            pyautogui.press('left')
+            print("Previous Slide")
+            time.sleep(0.7)
+
+        # 3️⃣ Zoom In (Pinch gesture where thumb and index move apart)
+        pinch_distance = math.sqrt(
+            (thumb_tip.x - index_tip.x)**2 +
+            (thumb_tip.y - index_tip.y)**2
+        )
+
+        # track pinch motion — start when close, then zoom when moving apart
+        if pinch_distance < 0.03:
+            self.pinch_start = pinch_distance
+        elif hasattr(self, 'pinch_start') and pinch_distance - self.pinch_start > 0.04:
+            pyautogui.hotkey('ctrl', '+')
+            print("Zoom In")
+            del self.pinch_start
+            time.sleep(0.5)
+
+        return self.ori_gesture
+
+
 
 class Controller:
     tx_old = 0
@@ -186,6 +231,33 @@ class Controller:
         pyautogui.scroll(-120 if Controller.pinchlv>0.0 else 120)
         pyautogui.keyUp('ctrl')
         pyautogui.keyUp('shift')
+
+
+        # ---------- Presentation Controls ----------
+    @staticmethod
+    def next_slide():
+        """Move to the next presentation slide"""
+        pyautogui.press('right')
+        print("Next Slide Triggered")
+
+    @staticmethod
+    def previous_slide():
+        """Move to the previous presentation slide"""
+        pyautogui.press('left')
+        print("Previous Slide Triggered")
+
+    @staticmethod
+    def zoom_in():
+        """Zoom in on the current presentation"""
+        pyautogui.hotkey('ctrl', '+')
+        print("Zoom In Triggered")
+
+    @staticmethod
+    def zoom_out():
+        """Zoom out on the current presentation"""
+        pyautogui.hotkey('ctrl', '-')
+        print("Zoom Out Triggered")
+
 
     @staticmethod
     def get_position(hand_result):
@@ -291,6 +363,8 @@ class Controller:
                 Controller.pinch_control_init(hand_result)
                 Controller.pinchmajorflag = True
             Controller.pinch_control(hand_result,Controller.changesystembrightness, Controller.changesystemvolume)
+        
+
 
 class GestureController:
     gc_mode = 0
@@ -431,13 +505,21 @@ class GestureController:
 
                                 handmajor.set_finger_state()
                                 handminor.set_finger_state()
-                                gest_name = handminor.get_gesture()
+                                # Update gestures
+                                gest_name_minor = handminor.get_gesture()
+                                gest_name_major = handmajor.get_gesture()
 
-                                if gest_name == Gest.PINCH_MINOR:
-                                    Controller.handle_controls(gest_name, handminor.hand_result, is_authorized)
+                                # Handle standard mouse/volume/brightness gestures
+                                if gest_name_minor == Gest.PINCH_MINOR:
+                                    Controller.handle_controls(gest_name_minor, handminor.hand_result, is_authorized)
                                 else:
-                                    gest_name = handmajor.get_gesture()
-                                    Controller.handle_controls(gest_name, handmajor.hand_result, is_authorized)
+                                    Controller.handle_controls(gest_name_major, handmajor.hand_result, is_authorized)
+
+                                # ---------- NEW: Presentation Controls ----------
+                                # Call perform_presentation_action() for both hands
+                                handmajor.perform_presentation_action()
+                                handminor.perform_presentation_action()
+
                                 
                                 for hand_landmarks in results.multi_hand_landmarks:
                                     mp_drawing.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
