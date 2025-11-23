@@ -23,7 +23,16 @@ from sklearn.pipeline import make_pipeline
 import joblib
 import warnings
 import subprocess
+import pygetwindow as gw
 warnings.filterwarnings('ignore')
+import glob
+import subprocess
+import winreg
+from difflib import get_close_matches
+# Keep track of where we came from so we can return if needed
+last_context = None   # possible values: None, 'presentation', 'browser', ...
+AUTO_RETURN_AFTER_SEARCH = False # Set True if you want automatic return after search
+
 
 # -------------Object Initialization---------------
 today = date.today()
@@ -54,6 +63,250 @@ files = []
 path = ''
 is_awake = True  # Bot status
 current_directory = 'C://'  # Track current directory
+import winreg
+import glob
+
+def get_all_installed_apps():
+    """
+    Returns a dict mapping normalized app names -> launch target.
+    Launch target may be:
+      - .lnk shortcut path
+      - .exe absolute path
+      - install folder (we will search .exe inside)
+      - built-in executable name (e.g., 'notepad.exe')
+    """
+    apps = {}
+
+    # A. Start Menu Shortcuts (.lnk)
+    start_menu_paths = [
+        os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs"),
+        os.path.expandvars(r"%PROGRAMDATA%\Microsoft\Windows\Start Menu\Programs"),
+    ]
+    for sm_path in start_menu_paths:
+        try:
+            for shortcut in glob.glob(os.path.join(sm_path, "**", "*.lnk"), recursive=True):
+                name = os.path.splitext(os.path.basename(shortcut))[0].lower()
+                apps[name] = shortcut
+        except Exception:
+            pass
+
+    # B. Registry Installed Apps
+    reg_paths = [
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ]
+    for reg_path in reg_paths:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path) as root:
+                for i in range(winreg.QueryInfoKey(root)[0]):
+                    try:
+                        subkey_name = winreg.EnumKey(root, i)
+                        with winreg.OpenKey(root, subkey_name) as subkey:
+                            try:
+                                display_name = winreg.QueryValueEx(subkey, "DisplayName")[0]
+                            except Exception:
+                                display_name = None
+                            try:
+                                install_loc = winreg.QueryValueEx(subkey, "InstallLocation")[0]
+                            except Exception:
+                                install_loc = None
+
+                            if display_name:
+                                key = display_name.lower()
+                                # prefer install location if available
+                                if install_loc:
+                                    apps[key] = install_loc
+                                else:
+                                    # keep what we have (maybe later Start Menu will override)
+                                    apps.setdefault(key, "") 
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # C. WindowsApps (UWP) - find exe files in package folders
+    uwp_dir = r"C:\Program Files\WindowsApps"
+    if os.path.isdir(uwp_dir):
+        try:
+            for folder in os.listdir(uwp_dir):
+                folder_path = os.path.join(uwp_dir, folder)
+                if os.path.isdir(folder_path):
+                    try:
+                        for f in os.listdir(folder_path):
+                            if f.lower().endswith(".exe"):
+                                name = os.path.splitext(f)[0].lower()
+                                apps[name] = os.path.join(folder_path, f)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # D. System32 tools (safe built-in exe names)
+    system_tools = ["notepad.exe", "calc.exe", "explorer.exe", "cmd.exe", "powershell.exe", "mspaint.exe"]
+    sys32 = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32")
+    for exe in system_tools:
+        exe_path = os.path.join(sys32, exe)
+        if os.path.exists(exe_path):
+            apps[os.path.splitext(exe)[0].lower()] = exe_path
+        else:
+            # fallback to name only (os.startfile will handle these)
+            apps.setdefault(os.path.splitext(exe)[0].lower(), exe)
+
+    # E. Portable EXEs in common user folders
+    user_home = os.path.expanduser("~")
+    portable_search = [
+        os.path.join(user_home, "Downloads"),
+        os.path.join(user_home, "Desktop"),
+        os.path.join(user_home, "Documents"),
+    ]
+    for d in portable_search:
+        if os.path.isdir(d):
+            try:
+                for exe in glob.glob(os.path.join(d, "**", "*.exe"), recursive=True):
+                    name = os.path.splitext(os.path.basename(exe))[0].lower()
+                    apps[name] = exe
+            except Exception:
+                pass
+
+    # Normalize: remove empty install locations for registry-only entries if Start Menu found later
+    # (Start Menu/WindowsApps entries added earlier will override)
+    return apps
+
+
+# --------------------------
+# MATCHER
+# --------------------------
+def match_app(user_input, app_dict):
+    """
+    Return the matched key from app_dict (or None).
+    Matching order: exact -> startswith -> fuzzy
+    """
+    if not user_input:
+        return None
+
+    name = user_input.lower().strip()
+    keys = list(app_dict.keys())
+
+    # Exact
+    if name in app_dict:
+        return name
+
+    # startswith
+    for k in keys:
+        if k.startswith(name):
+            return k
+
+    # fuzzy (reasonable cutoff)
+    match = get_close_matches(name, keys, n=1, cutoff=0.65)
+    if match:
+        return match[0]
+
+    return None
+
+
+# --------------------------
+# UNIVERSAL LAUNCHER
+# --------------------------
+def open_system_app(app_name):
+    """
+    Universal app launcher:
+    - auto-discovers installed apps and UWP exes
+    - launches .lnk or .exe or finds exe in folder
+    """
+    if not app_name:
+        return "No application name provided."
+
+    try:
+        apps = get_all_installed_apps()
+        match = match_app(app_name, apps)
+        if not match:
+            # try some common aliases: 'code' -> 'visual studio code', 'vscode' etc
+            # quick alias table (extend if you want)
+            aliases = {
+                "vscode": "visual studio code",
+                "visual studio": "visual studio",
+                "vs code": "visual studio code",
+                "whatsapp": "whatsapp",
+                "one note": "onenote",
+                "onenote": "onenote",
+                "snipping tool": "snippingtool",
+                "snip": "snippingtool",
+                "file explorer": "explorer",
+                "explorer": "explorer"
+            }
+            for a, b in aliases.items():
+                if a in app_name and b in apps:
+                    match = b
+                    break
+
+        if not match:
+            return f"I could not find an application named '{app_name}'."
+
+        target = apps.get(match)
+
+        # If it's a .lnk shortcut, launch it
+        if target and target.lower().endswith(".lnk"):
+            os.startfile(target)
+            return f"Opening {match}"
+
+        # If it's an exe path, launch it
+        if target and target.lower().endswith(".exe") and os.path.exists(target):
+            os.startfile(target)
+            return f"Opening {match}"
+
+        # If target is a folder (install location), search for exe inside
+        if target and os.path.isdir(target):
+            try:
+                for f in os.listdir(target):
+                    if f.lower().endswith(".exe"):
+                        exe_path = os.path.join(target, f)
+                        os.startfile(exe_path)
+                        return f"Opening {match}"
+            except Exception:
+                pass
+
+        # If nothing else, attempt a generic start by name (e.g., builtin exe names or PATH commands)
+        try:
+            os.startfile(match)
+            return f"Opening {match}"
+        except Exception:
+            pass
+
+        # Last-resort: try fuzzy-executing the match string via subprocess
+        try:
+            subprocess.Popen(match)
+            return f"Opening {match}"
+        except Exception as e:
+            return f"I found {match}, but could not start it: {e}"
+
+    except Exception as e:
+        return f"Error launching {app_name}: {e}"
+
+
+
+def minimize_browser_windows():
+    """
+    Minimize open browser windows like Chrome, Edge, or Firefox.
+    Useful before returning to PowerPoint so slides become visible.
+    """
+    import pygetwindow as gw
+
+    # Common browser window titles
+    browsers = ["Google Chrome", "Chrome", "Microsoft Edge", "Edge", "Firefox", "Mozilla Firefox"]
+
+    try:
+        all_titles = gw.getAllTitles()
+        for title in all_titles:
+            if any(b.lower() in title.lower() for b in browsers):
+                try:
+                    win = gw.getWindowsWithTitle(title)[0]
+                    win.minimize()
+                    print(f"🪟 Minimized browser: {title}")
+                except Exception as e:
+                    print(f"⚠️ Could not minimize {title}: {e}")
+    except Exception as e:
+        print(f"⚠️ Error minimizing browser windows: {e}")
+
 
 # -----------------Intent Recognition System----------------------
 class IntentRecognizer:
@@ -105,9 +358,10 @@ class IntentRecognizer:
                 'list directory', 'show me files', 'display folder contents',
                 'whats in this folder', 'open folder', 'open file'
             ],
-            'file_open': [
-                'open file', 'open number', 'open folder', 'launch file',
-                'open item', 'start file', 'open this file'
+            'open_file_path': [
+                'open file', 'open folder', 'open directory', 'open this file', 
+                'open this folder', 'go to folder', 'go to file', 'open my downloads',
+                'open my desktop', 'open my documents'
             ],
             'file_navigate': [
                 'go back', 'back', 'previous folder', 'navigate back',
@@ -137,8 +391,12 @@ class IntentRecognizer:
             'resume presentation', 'exit slideshow', 'zoom in', 'zoom out',
             'increase zoom', 'decrease zoom', 'make it bigger', 'make it smaller',
             'go full screen', 'exit full screen', 'move to first slide',
-            'go to last slide', 'skip to slide', 'show slide number'
-            ]
+            'go to last slide', 'skip to slide', 'show slide number','resume presentation',
+            'pause presentation', 'return to presentation', 'come back', 'bring presentation back',
+            'continue presentation'
+            ],
+            'open_app': ['open app', 'launch app', 'start app', 'open application', 'run', 'open program', 'start program']
+
         }
         return training_data
     
@@ -208,7 +466,7 @@ class IntentRecognizer:
             'search': ['search', 'find', 'look up', 'google'],
             'location': ['location', 'map', 'where is', 'locate'],
             'files': ['file', 'files', 'directory', 'folder', 'list'],
-            'file_open': ['open', 'launch', 'start'],
+            'open_file_path': ['open file', 'open folder', 'directory', 'folder', 'file'],
             'file_navigate': ['back', 'previous', 'go back', 'up'],
             'goodbye': ['bye', 'goodbye', 'exit', 'quit'],
             'copy': ['copy', 'copy this'],
@@ -221,8 +479,9 @@ class IntentRecognizer:
             'resume presentation', 'exit slideshow', 'zoom in', 'zoom out',
             'increase zoom', 'decrease zoom', 'make it bigger', 'make it smaller',
             'full screen', 'exit full screen', 'first slide', 'last slide',
-            'skip to slide', 'show slide number'
-            ]
+            'skip to slide', 'show slide number'],
+            'open_app': ['open app', 'launch', 'start', 'run']
+
         }
         
         for intent, keywords in intent_keywords.items():
@@ -234,6 +493,100 @@ class IntentRecognizer:
 
 # Initialize intent recognizer
 intent_recognizer = IntentRecognizer()
+
+def minimize_browser_windows():
+    """Minimize Chrome, Edge, or Firefox windows if open."""
+    import pygetwindow as gw
+
+    browsers = ["Google Chrome", "Chrome", "Microsoft Edge", "Edge", "Firefox", "Mozilla Firefox"]
+    try:
+        all_titles = gw.getAllTitles()
+        for title in all_titles:
+            if any(b.lower() in title.lower() for b in browsers):
+                try:
+                    win = gw.getWindowsWithTitle(title)[0]
+                    win.minimize()
+                    print(f"🪟 Minimized browser: {title}")
+                except Exception as e:
+                    print(f"⚠️ Could not minimize {title}: {e}")
+    except Exception as e:
+        print(f"⚠️ Error minimizing browser windows: {e}")
+
+
+def focus_powerpoint():
+    """Bring PowerPoint slideshow (not editor) into focus."""
+    import pygetwindow as gw
+    import pyautogui
+    import time
+
+    pyautogui.press("esc")
+
+    try:
+        keywords_slideshow = ["Slide Show", "PowerPoint Slide Show"]
+        keywords_editor = ["PowerPoint", "Microsoft PowerPoint", "Presentation"]
+
+        # Get all open windows
+        all_titles = gw.getAllTitles()
+        print(f"All open windows: {all_titles}")
+
+        # 1️⃣ Try to find slideshow window first
+        slide_windows = [t for t in all_titles if any(k.lower() in t.lower() for k in keywords_slideshow)]
+
+        if slide_windows:
+            # Focus existing slideshow window
+            window_title = slide_windows[-1]
+            ppt_window = gw.getWindowsWithTitle(window_title)[0]
+
+            ppt_window.restore()
+            ppt_window.activate()
+            time.sleep(0.5)
+            print(f"✅ Focused PowerPoint slideshow: {window_title}")
+            return True
+
+        # 2️⃣ If slideshow window not found, try to find PowerPoint editor and start slideshow
+        ppt_windows = [t for t in all_titles if any(k.lower() in t.lower() for k in keywords_editor)]
+
+        if ppt_windows:
+            window_title = ppt_windows[-1]
+            ppt_window = gw.getWindowsWithTitle(window_title)[0]
+
+            try:
+                ppt_window.restore()
+                ppt_window.activate()
+            except Exception as e:
+                print(f"⚠️ Could not restore PowerPoint editor: {e}")
+
+            time.sleep(0.8)
+            print("🔁 Slideshow not open, starting presentation now...")
+            pyautogui.press("f5")  # Start presentation
+            time.sleep(2)
+
+            # Try again to focus slideshow window
+            all_titles = gw.getAllTitles()
+            slide_windows = [t for t in all_titles if any(k.lower() in t.lower() for k in keywords_slideshow)]
+            if slide_windows:
+                slide_title = slide_windows[-1]
+                slide_window = gw.getWindowsWithTitle(slide_title)[0]
+                slide_window.activate()
+                print(f"✅ Focused newly started slideshow: {slide_title}")
+                return True
+
+        # 3️⃣ Final fallback: use Alt+Tab and try to start slideshow
+        print("⚠️ PowerPoint slideshow not found, using fallback...")
+        pyautogui.keyDown("alt")
+        pyautogui.press("tab")
+        pyautogui.keyUp("alt")
+        time.sleep(0.5)
+        pyautogui.press("f5")
+        print("✅ Started slideshow via fallback")
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Could not refocus PowerPoint slideshow: {e}")
+        return False
+
+
+
 
 # ------------------Functions----------------------
 def reply(audio):
@@ -282,58 +635,81 @@ def extract_entity(text, intent):
             place = place.replace(word, '').strip()
         return place if place and len(place) > 1 else None
     
-    elif intent in ['files', 'file_open']:
-        # Extract file number or name
-        numbers = re.findall(r'\d+', text_lower)
-        if numbers:
-            return int(numbers[0])  # Return the first number found
-        return None
+    elif intent == 'open_file_path':
+        cleaned = re.sub(
+            r'\b(open|file|folder|directory|go to|please|the|my)\b', 
+            '', 
+            text_lower
+        )
+        return cleaned.strip() if cleaned.strip() else None
+
     
     elif intent == 'file_navigate':
         return 'back'
     
+    elif intent == 'open_app':
+    # remove open keywords
+     name = re.sub(r'\b(open|launch|start|run|app|application|program)\b', '', text_lower).strip()
+     return name if name else None
+
+    elif intent == 'files':
+        cleaned = re.sub(
+            r'\b(open|file|files|folder|directory|go to|please|the|my)\b',
+            '',
+            text_lower
+        )
+        return cleaned.strip() if cleaned.strip() else None
+
+    
     elif intent == 'presentation_control':
-        # Remove the wake word and common filler words to get the presentation command
-        control_words = ['omega', 'presentation', 'slideshow', 'powerpoint', 'keynote', 'slide', 'please']
+        # Remove the wake word and common filler words, but keep "slide"
+        control_words = ['omega', 'presentation', 'slideshow', 'powerpoint', 'keynote', 'please','to the', 'to presentation', 'back to']
         command = text_lower
-        for word in control_words:
-            command = command.replace(word, '').strip()
         
-        # Remove extra spaces and return the clean command
+        # Remove only whole words to avoid partial deletions
+        for word in control_words:
+            command = re.sub(rf'\b{word}\b', '', command).strip()
+        
+        # Clean up extra spaces
         command = re.sub(r'\s+', ' ', command).strip()
+        
+        # Return cleaned command if valid
         return command if command and len(command) > 1 else text_lower
+
     return None
 
-def open_file_or_folder(full_path):
-    """Open a file or folder using the appropriate method"""
-    try:
-        if exists(full_path):
-            if isfile(full_path):
-                # It's a file - open it with default application
-                os.startfile(full_path)
-                return f"Opened file: {os.path.basename(full_path)}"
-            else:
-                # It's a folder - navigate into it
-                global current_directory, files, file_exp_status
-                current_directory = full_path
-                files = listdir(current_directory)
+
+
+# def open_file_or_folder(full_path):
+#     """Open a file or folder using the appropriate method"""
+#     try:
+#         if exists(full_path):
+#             if isfile(full_path):
+#                 # It's a file - open it with default application
+#                 os.startfile(full_path)
+#                 return f"Opened file: {os.path.basename(full_path)}"
+#             else:
+#                 # It's a folder - navigate into it
+#                 global current_directory, files, file_exp_status
+#                 current_directory = full_path
+#                 files = listdir(current_directory)
                 
-                # Display new directory contents
-                filestr = ""
-                counter = 0
-                for f in files:
-                    counter += 1
-                    item_type = "file" if isfile(join(current_directory, f)) else "folder"
-                    filestr += f"{counter}: {f} ({item_type})<br>"
-                    print(f"{counter}: {f} ({item_type})")
+#                 # Display new directory contents
+#                 filestr = ""
+#                 counter = 0
+#                 for f in files:
+#                     counter += 1
+#                     item_type = "file" if isfile(join(current_directory, f)) else "folder"
+#                     filestr += f"{counter}: {f} ({item_type})<br>"
+#                     print(f"{counter}: {f} ({item_type})")
                 
-                file_exp_status = True
-                app.ChatBot.addAppMsg(filestr)
-                return f"Opened folder: {os.path.basename(full_path)}"
-        else:
-            return f"Path does not exist: {full_path}"
-    except Exception as e:
-        return f"Error opening: {str(e)}"
+#                 file_exp_status = True
+#                 app.ChatBot.addAppMsg(filestr)
+#                 return f"Opened folder: {os.path.basename(full_path)}"
+#         else:
+#             return f"Path does not exist: {full_path}"
+#     except Exception as e:
+#         return f"Error opening: {str(e)}"
 
 def navigate_back():
     """Navigate to parent directory"""
@@ -412,27 +788,62 @@ def handle_date_query():
     reply(today.strftime("Today's date is %B %d, %Y"))
 
 def handle_search(query):
-    """Handle search intent"""
+    """
+    Launch a web search, and remember if we came from a presentation
+    so we can return on demand (or automatically if AUTO_RETURN_AFTER_SEARCH=True).
+    """
+    global last_context
     if query:
-        reply(f'Searching for {query}')
-        url = 'https://google.com/search?q=' + query.replace(' ', '+')
+        reply(f"Searching for {query}")
         try:
+            import pygetwindow as gw
+            import time
+            import webbrowser
+
+            # Detect current active window (if possible) to remember context
+            try:
+                active_win = gw.getActiveWindow()
+                active_title = active_win.title.lower() if active_win and active_win.title else ""
+                if "powerpoint" in active_title or "slide show" in active_title or "presentation" in active_title:
+                    last_context = "presentation"
+                    # ✅ Minimize PowerPoint temporarily
+                    try:
+                        active_win.minimize()
+                        print("🪄 Minimized PowerPoint before search to keep Chrome visible.")
+                    except Exception as e:
+                        print(f"Could not minimize PowerPoint: {e}")
+                else:
+                    last_context = None
+            except Exception as _:
+                last_context = None
+
+            # Perform the search
+            url = "https://google.com/search?q=" + query.replace(" ", "+")
             webbrowser.get().open(url)
-            reply('Here are the search results I found')
-        except:
-            reply('Please check your internet connection')
+            reply("Here are the search results I found")
+
+            # Optional: automatic return if explicitly enabled
+            if AUTO_RETURN_AFTER_SEARCH and last_context == "presentation":
+                time.sleep(2)
+                pyautogui.press("esc")
+
+
+                success = focus_powerpoint()
+                if success:
+                    reply("Returned to the presentation.")
+                else:
+                    reply("I couldn't return to the presentation automatically.")
+
+        except Exception as e:
+            print("handle_search error:", e)
+            reply("Please check your internet connection")
     else:
-        reply('What would you like me to search for?')
+        reply("What would you like me to search for?")
         temp_audio = record_audio()
         if temp_audio:
-            query = temp_audio
-            reply(f'Searching for {query}')
-            url = 'https://google.com/search?q=' + query.replace(' ', '+')
-            try:
-                webbrowser.get().open(url)
-                reply('Here are the search results')
-            except:
-                reply('Please check your internet connection')
+            handle_search(temp_audio)
+
+
 
 def handle_location(place):
     """Handle location intent"""
@@ -457,47 +868,219 @@ def handle_location(place):
             except:
                 reply('Please check your internet connection')
 
-def handle_files(operation, voice_data):
-    """Handle file listing"""
-    global file_exp_status, files, current_directory
+# def handle_files(operation, voice_data):
+#     """Handle file listing"""
+#     global file_exp_status, files, current_directory
     
-    if operation == 'list' or not operation:
-        counter = 0
-        current_directory = 'C://'
-        try:
-            files = listdir(current_directory)
-            filestr = ""
-            for f in files:
-                counter += 1
-                item_type = "file" if isfile(join(current_directory, f)) else "folder"
-                filestr += f"{counter}: {f} ({item_type})<br>"
-                print(f"{counter}: {f} ({item_type})")
-            file_exp_status = True
-            reply('These are the files in your root directory')
-            app.ChatBot.addAppMsg(filestr)
-        except Exception as e:
-            reply(f'Error accessing directory: {e}')
-
-def handle_file_open(file_number, voice_data):
-    """Handle file/folder opening by number"""
-    global file_exp_status, files, current_directory
-    
-    if not file_exp_status:
-        reply("Please list files first using 'list files' command")
-        return
-    
-    try:
-        if file_number and 1 <= file_number <= len(files):
-            file_index = file_number - 1
-            selected_item = files[file_index]
-            full_path = join(current_directory, selected_item)
+#     if operation == 'list' or not operation:
+#         counter = 0
+#         current_directory = 'C://'
+#         try:
+#             files = listdir(current_directory)
+#             filestr = ""
+#             for f in files:
+#                 counter += 1
+#                 item_type = "file" if isfile(join(current_directory, f)) else "folder"
+#                 filestr += f"{counter}: {f} ({item_type})<br>"
+#                 print(f"{counter}: {f} ({item_type})")
+#             file_exp_status = True
+#             reply('These are the files in your root directory')
+#             app.ChatBot.addAppMsg(filestr)
+#         except Exception as e:
+#             reply(f'Error accessing directory: {e}')
             
-            result = open_file_or_folder(full_path)
-            reply(result)
-        else:
-            reply(f"Please specify a valid file number between 1 and {len(files)}")
-    except Exception as e:
-        reply(f"Error opening file: {str(e)}")
+def handle_open_file_path(name):
+    """
+    Open files or folders by natural names:
+    - 'downloads', 'desktop', 'documents', 'c drive', 'd drive'
+    - filename (searches common user folders)
+    - full path (if provided)
+    - 'recent <type>' opens recent files
+    """
+    if not name:
+        reply("Which file or folder should I open?")
+        return
+
+    name = name.lower().strip()
+    home = os.path.expanduser("~")
+
+    # ---------------------------
+    # 1. Friendly folder names
+    # ---------------------------
+    known = {
+        "desktop": os.path.join(home, "Desktop"),
+        "documents": os.path.join(home, "Documents"),
+        "downloads": os.path.join(home, "Downloads"),
+        "pictures": os.path.join(home, "Pictures"),
+        "music": os.path.join(home, "Music"),
+        "videos": os.path.join(home, "Videos"),
+        "c drive": "C:\\",
+        "d drive": "D:\\"
+    }
+
+    if name in known:
+        path = known[name]
+        if os.path.exists(path):
+            try:
+                os.startfile(path)
+                reply(f"Opening {name}")
+                return
+            except Exception as e:
+                reply(f"Could not open {name}: {e}")
+                return
+
+    # ---------------------------
+    # 2. Full path handling
+    # ---------------------------
+    if " slash " in name:
+        name = name.replace(" slash ", os.sep)
+
+    if os.path.exists(name):
+        try:
+            os.startfile(name)
+            reply(f"Opening {name}")
+            return
+        except Exception as e:
+            reply(f"Could not open {name}: {e}")
+            return
+
+    # ---------------------------
+    # 3. Recent file support
+    # ---------------------------
+    if name.startswith("recent"):
+        parts = name.split()
+        pattern = "*"
+        if len(parts) > 1:
+            q = parts[1]
+            pattern = f"*{q}*" if "." not in q else f"*{q}"
+
+        search_dirs = [home, os.path.join(home, "Downloads"), os.path.join(home, "Desktop")]
+        latest = (None, 0)
+
+        for d in search_dirs:
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if glob.fnmatch.fnmatch(f.lower(), pattern.lower()):
+                        full = os.path.join(root, f)
+                        try:
+                            mtime = os.path.getmtime(full)
+                            if mtime > latest[1]:
+                                latest = (full, mtime)
+                        except:
+                            pass
+
+        if latest[0]:
+            try:
+                os.startfile(latest[0])
+                reply(f"Opening recent file {os.path.basename(latest[0])}")
+                return
+            except Exception as e:
+                reply(f"Could not open recent file: {e}")
+                return
+
+        reply("No recent file found.")
+        return
+
+    # ---------------------------
+    # 4. Search for folders/files (PRIORITIZED)
+    # ---------------------------
+    search_dirs = [
+        os.path.join(home, "Desktop"),
+        os.path.join(home, "Documents"),
+        os.path.join(home, "Downloads"),
+        home
+    ]
+
+    best_startswith = None
+    best_contains = None
+
+    for d in search_dirs:
+        for root, dirs, files in os.walk(d):
+
+            # Avoid system / cache folders
+            skip = ["appdata", "cache", "indexeddb", "leveldb", "temp"]
+            if any(s in root.lower() for s in skip):
+                continue
+
+            # ---------Exact folder match---------
+            for fol in dirs:
+                if fol.lower() == name:
+                    full = os.path.join(root, fol)
+                    os.startfile(full)
+                    reply(f"Opening folder {fol}")
+                    return
+
+            # ---------Starts-with match---------
+            for fol in dirs:
+                if fol.lower().startswith(name):
+                    best_startswith = os.path.join(root, fol)
+
+            # ---------Contains match---------
+            for fol in dirs:
+                if name in fol.lower():
+                    if not best_contains:
+                        best_contains = os.path.join(root, fol)
+
+            # ---------Exact file match---------
+            for f in files:
+                if f.lower() == name:
+                    full = os.path.join(root, f)
+                    os.startfile(full)
+                    reply(f"Opening file {f}")
+                    return
+
+            # ---------File starts-with---------
+            for f in files:
+                if f.lower().startswith(name):
+                    best_startswith = os.path.join(root, f)
+
+            # ---------File contains---------
+            for f in files:
+                if name in f.lower():
+                    if not best_contains:
+                        best_contains = os.path.join(root, f)
+
+    # ---------------------------
+    # 5. Choose the best match
+    # ---------------------------
+    if best_startswith:
+        os.startfile(best_startswith)
+        reply(f"Opening {os.path.basename(best_startswith)}")
+        return
+
+    if best_contains:
+        os.startfile(best_contains)
+        reply(f"Opening {os.path.basename(best_contains)}")
+        return
+
+    # ---------------------------
+    # 6. Nothing found
+    # ---------------------------
+    reply(f"I couldn't find any file or folder named {name}.")
+    return
+
+
+
+# def handle_file_open(file_number, voice_data):
+#     """Handle file/folder opening by number"""
+#     global file_exp_status, files, current_directory
+    
+#     if not file_exp_status:
+#         reply("Please list files first using 'list files' command")
+#         return
+    
+#     try:
+#         if file_number and 1 <= file_number <= len(files):
+#             file_index = file_number - 1
+#             selected_item = files[file_index]
+#             full_path = join(current_directory, selected_item)
+            
+#             result = open_file_or_folder(full_path)
+#             reply(result)
+#         else:
+#             reply(f"Please specify a valid file number between 1 and {len(files)}")
+#     except Exception as e:
+#         reply(f"Error opening file: {str(e)}")
 
 def handle_file_navigate(operation):
     """Handle file navigation"""
@@ -531,10 +1114,19 @@ def handle_wake_up():
     is_awake = True
     wish()
 
+def handle_open_app(app_name):
+    if not app_name:
+        reply("Which application should I open?")
+        return
+
+    result = open_system_app(app_name)
+    reply(result)
+
+
 def handle_presentation_control(command):
     """
     Handle presentation control commands such as:
-    next slide, previous slide, start presentation, end presentation, etc.
+    next slide, previous slide, start presentation, end presentation,resume presentation etc.
     """
     command = command.lower().strip()
 
@@ -548,13 +1140,27 @@ def handle_presentation_control(command):
             pyautogui.press('left')
             reply("Went back to the previous slide.")
         
-        elif any(kw in command for kw in ["start", "begin", "slideshow", "present"]):
-            pyautogui.press('f5')
-            reply("Starting the presentation.")
+        elif any(kw in command for kw in ["start", "begin", "show", "play", "slideshow", "present"]):
+            print("🎬 Starting presentation...")
+            success = focus_powerpoint()  # make sure PowerPoint is active
+            if success:
+                time.sleep(0.8)
+                pyautogui.press("f5")  # Start presentation from beginning
+                reply("Starting your presentation now.")
+            else:
+                reply("I couldn't find PowerPoint to start the presentation.")
         
         elif any(kw in command for kw in ["end", "exit", "stop", "close"]):
-            pyautogui.press('esc')
-            reply("Presentation closed.")
+            print("🛑 Exiting full screen or slideshow...")
+            minimize_browser_windows()
+            time.sleep(0.8)
+            success = focus_powerpoint()
+            if success:
+                time.sleep(0.5)
+                pyautogui.press("esc")  # Exit slideshow mode
+                reply("Exited the presentation screen.")
+            else:
+                reply("I couldn't find PowerPoint to exit the presentation.")
         
         elif any(kw in command for kw in ["pause"]):
             pyautogui.press('b')  # black screen pause
@@ -587,6 +1193,19 @@ def handle_presentation_control(command):
         elif any(kw in command for kw in ["last slide", "final slide"]):
             pyautogui.hotkey('end')
             reply("Moved to the last slide.")
+        
+            # ... existing code ...
+        elif any(kw in command for kw in ["return", "come back", "bring back", "continue", "resume"]):
+            # Try to refocus PowerPoint
+            minimize_browser_windows()
+            time.sleep(0.8)
+
+            success = focus_powerpoint()
+            if success:
+                reply("Returned to the presentation.")
+            else:
+                reply("I couldn't find the presentation window to return to.")
+
         
         elif any(kw in command for kw in ["slide", "skip to slide", "go to slide"]):
             # Extract slide number if mentioned
@@ -657,10 +1276,12 @@ def respond(voice_data):
         handle_location(entity)
     
     elif intent == 'files':
-        handle_files(entity, processed_voice)
+        if not entity:
+            entity = extract_entity(processed_voice, 'open_file_path')
+        handle_open_file_path(entity)    
     
-    elif intent == 'file_open':
-        handle_file_open(entity, processed_voice)
+    elif intent == 'open_file_path':
+        handle_open_file_path(entity)
     
     elif intent == 'file_navigate':
         handle_file_navigate(entity)
@@ -679,6 +1300,10 @@ def respond(voice_data):
 
     elif intent == 'presentation_control':
         handle_presentation_control(entity)
+    
+    elif intent == 'open_app':
+        handle_open_app(entity)
+
     
     else:
         # Fallback for unknown intents
