@@ -27,12 +27,24 @@ import pygetwindow as gw
 warnings.filterwarnings('ignore')
 import glob
 import subprocess
+import pytesseract
+from PIL import ImageGrab, Image
+import pyautogui
+import cv2
+import numpy as np
 import winreg
 from difflib import get_close_matches
+import win32gui
+import win32con
+import win32api
+import pythoncom
+
+
 # Keep track of where we came from so we can return if needed
 last_context = None   # possible values: None, 'presentation', 'browser', ...
 AUTO_RETURN_AFTER_SEARCH = False # Set True if you want automatic return after search
 
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # -------------Object Initialization---------------
 today = date.today()
@@ -65,6 +77,8 @@ is_awake = True  # Bot status
 current_directory = 'C://'  # Track current directory
 import winreg
 import glob
+
+
 
 def get_all_installed_apps():
     """
@@ -173,9 +187,6 @@ def get_all_installed_apps():
     return apps
 
 
-# --------------------------
-# MATCHER
-# --------------------------
 def match_app(user_input, app_dict):
     """
     Return the matched key from app_dict (or None).
@@ -203,10 +214,251 @@ def match_app(user_input, app_dict):
 
     return None
 
+# ---------- UNIVERSAL 3-LAYER TASKBAR + ICON OPENER ----------
+def get_taskbar_buttons():
+    """
+    Universal collector of candidate taskbar icon HWNDs / centers.
+    Returns list of (hwnd, center_x, center_y).
+    This is a best-effort collector: some Windows 11 systems return wrapper HWNDs;
+    we still return center points which we will hover and OCR or click.
+    """
+    pythoncom.CoInitialize()
+    result = []
 
-# --------------------------
-# UNIVERSAL LAUNCHER
-# --------------------------
+    try:
+        taskbar = win32gui.FindWindow("Shell_TrayWnd", None)
+        if not taskbar:
+            return result
+
+        # Candidate container class names (try all)
+        possible = [
+            "MSTaskListWClass", "MSTaskSwWClass", "ToolbarWindow32",
+            "ReBarWindow32", "Windows.UI.Core.CoreWindow",
+            "Windows.UI.Composition.DesktopWindowContentBridge"
+        ]
+
+        # Enumerate children of Shell_TrayWnd
+        children = []
+        def enum_child(hwnd, _):
+            children.append(hwnd)
+        win32gui.EnumChildWindows(taskbar, enum_child, None)
+
+        # For each descendant container, enumerate its children and collect rect centers
+        for cont in children:
+            try:
+                cls = win32gui.GetClassName(cont)
+            except:
+                cls = ""
+            if cls not in possible and not cls.lower().startswith("tool"):
+                # still attempt to pull children from everything (broad)
+                pass
+
+            # Enumerate grandchildren (the actual icon buttons often are grandchildren)
+            def enum_grandchild(hwnd, _):
+                try:
+                    rect = win32gui.GetWindowRect(hwnd)
+                    # Filter tiny/invalid rects
+                    w = rect[2] - rect[0]
+                    h = rect[3] - rect[1]
+                    if w <= 8 or h <= 8:
+                        return
+                    cx = (rect[0] + rect[2]) // 2
+                    cy = (rect[1] + rect[3]) // 2
+                    result.append((hwnd, cx, cy))
+                except Exception:
+                    pass
+
+            win32gui.EnumChildWindows(cont, enum_grandchild, None)
+
+        # If still empty, fall back to sampling along the taskbar rectangle
+        if not result:
+            try:
+                rect = win32gui.GetWindowRect(taskbar)
+                left, top, right, bottom = rect
+                # sample horizontally across the taskbar (20 points)
+                steps = 20
+                for i in range(steps):
+                    cx = left + int((i + 0.5) * (right - left) / steps)
+                    cy = top + (bottom - top) // 2
+                    result.append((None, cx, cy))
+            except:
+                pass
+
+    except Exception:
+        pass
+
+    # Deduplicate by center coordinates (keep unique centers)
+    seen = set()
+    filtered = []
+    for item in result:
+        _, cx, cy = item
+        key = (cx, cy)
+        if key not in seen:
+            seen.add(key)
+            filtered.append(item)
+
+    return filtered
+
+
+def _hover_and_ocr_matches(app_name, centers, ocr_timeout=1.2):
+    """
+    Hover over each center point in 'centers' (list of (hwnd, x, y)).
+    After hovering, capture a quick screenshot and run pytesseract to see tooltip text.
+    Returns (x,y) of matched center or None.
+    """
+    app_name = app_name.lower().strip()
+    for item in centers:
+        _, cx, cy = item
+        try:
+            pyautogui.moveTo(cx, cy, duration=0.12)
+            # small pause for tooltip to appear
+            time.sleep(0.35)
+            # capture a region around mouse for speed — tooltips usually near cursor
+            screen = ImageGrab.grab()
+            text = pytesseract.image_to_string(screen).lower()
+            if app_name in text:
+                return (cx, cy)
+            # optional: small scroll to reveal hidden tooltips (skip by default)
+        except Exception as e:
+            # continue to next candidate
+            print("hover_ocr error:", e)
+            continue
+    return None
+
+
+def _match_icon_templates_on_screen(app_name, templates, threshold=0.65):
+    """
+    Try multi-template multi-scale matching on the full screen.
+    templates: list of file paths for the same icon (different variants).
+    Returns center (x,y) on screen if match found, else None.
+    """
+    try:
+        screen = np.array(ImageGrab.grab())
+        screen_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
+    except Exception as e:
+        print("screenshot error:", e)
+        return None
+
+    for template_path in templates:
+        try:
+            if not os.path.exists(template_path):
+                continue
+            tpl = cv2.imread(template_path, 0)
+            if tpl is None:
+                continue
+            (tH, tW) = tpl.shape[:2]
+            # edge fallback for robustness
+            tpl_edges = cv2.Canny(tpl, 50, 150)
+
+            best_val = 0
+            best_loc = None
+            best_size = (tW, tH)
+
+            # scale variations
+            for scale in np.linspace(0.5, 1.6, 18):
+                rw = int(tW * scale)
+                rh = int(tH * scale)
+                if rw < 8 or rh < 8 or rw > screen.shape[1] or rh > screen.shape[0]:
+                    continue
+                resized = cv2.resize(tpl, (rw, rh))
+                try:
+                    res = cv2.matchTemplate(screen_gray, resized, cv2.TM_CCOEFF_NORMED)
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                    if max_val > best_val:
+                        best_val = max_val
+                        best_loc = max_loc
+                        best_size = (rw, rh)
+                except Exception:
+                    pass
+
+                # edge-match
+                try:
+                    resized_edges = cv2.resize(tpl_edges, (rw, rh))
+                    screen_edges = cv2.Canny(screen_gray, 50, 150)
+                    res_e = cv2.matchTemplate(screen_edges, resized_edges, cv2.TM_CCOEFF_NORMED)
+                    _, max_val_e, _, max_loc_e = cv2.minMaxLoc(res_e)
+                    if max_val_e > best_val:
+                        best_val = max_val_e
+                        best_loc = max_loc_e
+                        best_size = (rw, rh)
+                except Exception:
+                    pass
+
+            if best_loc and best_val >= threshold:
+                x = best_loc[0] + best_size[0] // 2
+                y = best_loc[1] + best_size[1] // 2
+                return (x, y)
+        except Exception as e:
+            print("template error:", e)
+            continue
+
+    return None
+
+
+def open_taskbar_app(app_name):
+    """
+    Universal 3-layer launcher:
+      1) Direct system launch via open_system_app()
+      2) Hover + OCR over taskbar icons
+      3) Template matching on full screen (multi-scale)
+    Returns True if opened, False otherwise.
+    """
+    name = app_name.lower().strip()
+
+    # --------- Layer 1: Direct launch (fast & reliable if installed) ----------
+    try:
+        # open_system_app returns a human message; consider success if it indicates opening
+        sys_result = open_system_app(name)
+        if isinstance(sys_result, str):
+            low = sys_result.lower()
+            if "opening" in low and "could not" not in low:
+                reply(f"Opened {name} directly.")
+                return True
+    except Exception:
+        pass
+
+    # --------- Layer 2: Hover + OCR (universal for pinned taskbar icons) -----
+    try:
+        centers = get_taskbar_buttons()
+        if centers:
+            # centers is list of (hwnd, x, y) or similar — ensure format
+            # if returned (hwnd,x,y), keep as-is; if (hwnd, x, y) where hwnd may be None
+            match = _hover_and_ocr_matches(name, centers)
+            if match:
+                mx, my = match
+                pyautogui.click(mx, my)
+                reply(f"Opening {name} from taskbar (tooltip match).")
+                return True
+    except Exception as e:
+        print("hover layer error:", e)
+
+    # --------- Layer 3: Template matching (icon vision) ---------------------
+    # templates: map of appname -> list of template file paths
+    TEMPLATES = {
+        # Local files you uploaded (adjust or add more file paths if you like)
+        "whatsapp": [r"/mnt/data/whatsapp icon.png", r"/mnt/data/whatsapp.png"],
+        # Add other apps here, e.g.
+        # "chrome": [r"C:\path\to\chrome_template.png"],
+        # "edge": [r"C:\path\to\edge_template.png"],
+    }
+
+    try:
+        templates = TEMPLATES.get(name, [])
+        if templates:
+            pos = _match_icon_templates_on_screen(name, templates, threshold=0.66)
+            if pos:
+                px, py = pos
+                pyautogui.moveTo(px, py, duration=0.18)
+                pyautogui.click()
+                reply(f"Opening {name} from screen match.")
+                return True
+    except Exception as e:
+        print("template layer error:", e)
+
+    # Nothing found
+    reply(f"I could not find {name} on your taskbar or system.")
+    return False
+
 def open_system_app(app_name):
     """
     Universal app launcher:
@@ -283,7 +535,6 @@ def open_system_app(app_name):
         return f"Error launching {app_name}: {e}"
 
 
-
 def minimize_browser_windows():
     """
     Minimize open browser windows like Chrome, Edge, or Firefox.
@@ -307,7 +558,338 @@ def minimize_browser_windows():
     except Exception as e:
         print(f"⚠️ Error minimizing browser windows: {e}")
 
+# place these module-level cache vars near the top of your module/file
+_ocr_image_cache = {"image_hash": None, "data": None}
 
+_ocr_cache = {"img_hash": None, "data": None}
+
+def find_text_boxes(target, fuzzy_threshold=0.65):
+    """
+    Accurate OCR text finder for both:
+    - SINGLE WORDS (primary, unchanged behavior)
+    - MULTI-WORD PHRASES (added, but isolated so single words are never affected)
+
+    No architecture changes.
+    Just accuracy fixes.
+    """
+
+    from difflib import SequenceMatcher
+    import re
+
+    # ----------------------------
+    # Normalize spoken numbers
+    # ----------------------------
+    number_words = {
+        "zero":"0","one":"1","two":"2","three":"3","four":"4","five":"5",
+        "six":"6","seven":"7","eight":"8","nine":"9","ten":"10"
+    }
+    parts = target.lower().strip().split()
+    target = " ".join([number_words.get(w, w) for w in parts]).strip()
+    target_words = target.split()
+
+    single_word_mode = (len(target_words) == 1)
+    multi_word_mode  = (len(target_words) >  1)
+
+    # Raise fuzzy threshold for short UI labels
+    if single_word_mode and len(target) <= 5:
+        fuzzy_threshold = max(fuzzy_threshold, 0.85)
+
+    if not target:
+        return []
+
+    # ----------------------------
+    # 1. OCR CAPTURE
+    # ----------------------------
+    img = ImageGrab.grab()
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+    # ----------------------------
+    # Helper: Fix OCR errors
+    # ----------------------------
+    def fix_ocr(w):
+        return (
+            w.replace("1", "i")
+             .replace("l", "i")
+             .replace("|", "i")
+             .replace("0", "o")
+             .replace("5", "s")
+             .replace("$", "s")
+        )
+
+    # ==========================================================
+    # MODE 1: HIGH-ACCURACY SINGLE WORD MATCHING
+    # ==========================================================
+    word_hits = []
+    if single_word_mode:
+
+        for i, raw_word in enumerate(data["text"]):
+            if not raw_word.strip():
+                continue
+
+            word = raw_word.lower().strip()
+            fixed = fix_ocr(word)
+
+            x = data["left"][i]
+            y = data["top"][i]
+            w = data["width"][i]
+            h = data["height"][i]
+
+            # direct or substring
+            if target == word or target in word or word in target:
+                word_hits.append((x, y, w, h))
+                continue
+
+            # fuzzy raw
+            if SequenceMatcher(None, target, word).ratio() >= fuzzy_threshold:
+                word_hits.append((x, y, w, h))
+                continue
+
+            # fuzzy corrected
+            if SequenceMatcher(None, target, fixed).ratio() >= fuzzy_threshold:
+                word_hits.append((x, y, w, h))
+                continue
+
+        if word_hits:
+            return word_hits
+
+    # ==========================================================
+    # 2. ORIGINAL LINE GROUPING (UNCHANGED STRUCTURE)
+    # ==========================================================
+    lines = {}
+    for i, raw_word in enumerate(data["text"]):
+        if not raw_word.strip():
+            continue
+
+        block = data["block_num"][i]
+        ln = data["line_num"][i]
+        key = (block, ln)
+
+        x = data["left"][i]
+        y = data["top"][i]
+        w = data["width"][i]
+        h = data["height"][i]
+
+        if key not in lines:
+            lines[key] = {"words": [], "boxes": []}
+
+        lines[key]["words"].append(raw_word.lower())
+        lines[key]["boxes"].append((x, y, w, h))
+
+    matches = []
+
+    # ==========================================================
+    # MODE 2: MULTI-WORD PHRASE MATCHING
+    # ==========================================================
+    for key, info in lines.items():
+
+        # cluster split (same as before)
+        entries = list(zip(info["words"], info["boxes"]))
+        entries.sort(key=lambda e: e[1][0])
+
+        clusters = []
+        cluster = [entries[0]]
+
+        for i in range(1, len(entries)):
+            prev_x, prev_w = entries[i-1][1][0], entries[i-1][1][2]
+            curr_x = entries[i][1][0]
+            gap = curr_x - (prev_x + prev_w)
+
+            if gap < 50:
+                cluster.append(entries[i])
+            else:
+                clusters.append(cluster)
+                cluster = [entries[i]]
+
+        clusters.append(cluster)
+
+        # Evaluate clusters
+        for cluster in clusters:
+
+            text = " ".join([w for w, _ in cluster])
+
+            xs = [b[0] for _, b in cluster]
+            ys = [b[1] for _, b in cluster]
+            ws = [b[2] for _, b in cluster]
+            hs = [b[3] for _, b in cluster]
+
+            x1 = min(xs)
+            y1 = min(ys)
+            x2 = max(xs[i] + ws[i] for i in range(len(ws)))
+            y2 = max(ys[i] + hs[i] for i in range(len(hs)))
+            box = (x1, y1, x2 - x1, y2 - y1)
+
+            # ---------------------
+            # MULTI-WORD LOGIC
+            if multi_word_mode:
+
+                # direct phrase substring
+                if target in text:
+                    matches.append(box)
+                    continue
+
+                # fuzzy entire phrase
+                if SequenceMatcher(None, target, text).ratio() >= fuzzy_threshold:
+                    matches.append(box)
+                    continue
+
+                # token-level majority match
+                token_hits = sum(1 for t in target_words if t in text)
+                if token_hits >= max(1, len(target_words)//2):
+                    matches.append(box)
+                    continue
+
+            # ---------------------
+            # FALLBACK SINGLE-WORD LOGIC
+            if single_word_mode:
+                if target in text:
+                    matches.append(box)
+                    continue
+                if SequenceMatcher(None, target, text).ratio() >= fuzzy_threshold:
+                    matches.append(box)
+
+    return matches
+
+def scroll_and_find(target, max_scrolls=20):
+    """Scroll the screen and search for text."""
+    for _ in range(max_scrolls):
+        boxes = find_text_boxes(target)
+        if boxes:
+            return boxes
+        pyautogui.scroll(-800)  # scroll down
+        time.sleep(0.3)
+    return []
+
+def perform_click_action(entity, is_double=False, full_cmd=""):
+    target = entity.lower().strip()
+
+    # Normalize number words
+    num_map = {
+        "zero":"0","one":"1","two":"2","three":"3","four":"4","five":"5",
+        "six":"6","seven":"7","eight":"8","nine":"9","ten":"10"
+    }
+    parts = target.split()
+    target = " ".join([num_map.get(w, w) for w in parts])
+
+    reply(f"Searching for {target}...")
+
+    # 1. Try exact/partial text match
+    boxes = find_text_boxes(target)
+
+    # Detect nth occurrence
+    index = 0
+    mapping = {
+        "first":0,"1st":0,
+        "second":1,"2nd":1,
+        "third":2,"3rd":2,
+        "fourth":3,"4th":3
+    }
+
+    for w in full_cmd.lower().split():
+        if w in mapping:
+            index = mapping[w]
+
+    # 2. If not visible → scroll
+    if not boxes:
+        boxes = scroll_and_find(target)
+
+    if not boxes:
+        reply(f"I could not find {entity} on the screen.")
+        return
+
+    # 3. Region targeting
+    cmd = full_cmd.lower()
+    if "top right" in cmd:
+        boxes = sorted(boxes, key=lambda b: (b[1], -b[0]))
+    elif "top left" in cmd:
+        boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    elif "bottom right" in cmd:
+        boxes = sorted(boxes, key=lambda b: (-b[1], -b[0]))
+    elif "bottom left" in cmd:
+        boxes = sorted(boxes, key=lambda b: (-b[1], b[0]))
+
+    # 6. Choose match by index
+    try:
+        x, y, w, h = boxes[index]
+    except:
+        x, y, w, h = boxes[0]
+
+    # Final click
+    pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
+    pyautogui.doubleClick() if is_double else pyautogui.click()
+
+    reply("Done.")
+
+def focus_powerpoint():
+    """Bring PowerPoint slideshow (not editor) into focus."""
+    import pygetwindow as gw
+    import pyautogui
+    import time
+
+    pyautogui.press("esc")
+
+    try:
+        keywords_slideshow = ["Slide Show", "PowerPoint Slide Show"]
+        keywords_editor = ["PowerPoint", "Microsoft PowerPoint", "Presentation"]
+
+        # Get all open windows
+        all_titles = gw.getAllTitles()
+        print(f"All open windows: {all_titles}")
+
+        # 1️⃣ Try to find slideshow window first
+        slide_windows = [t for t in all_titles if any(k.lower() in t.lower() for k in keywords_slideshow)]
+
+        if slide_windows:
+            # Focus existing slideshow window
+            window_title = slide_windows[-1]
+            ppt_window = gw.getWindowsWithTitle(window_title)[0]
+
+            ppt_window.restore()
+            ppt_window.activate()
+            time.sleep(0.5)
+            print(f"✅ Focused PowerPoint slideshow: {window_title}")
+            return True
+
+        # 2️⃣ If slideshow window not found, try to find PowerPoint editor and start slideshow
+        ppt_windows = [t for t in all_titles if any(k.lower() in t.lower() for k in keywords_editor)]
+
+        if ppt_windows:
+            window_title = ppt_windows[-1]
+            ppt_window = gw.getWindowsWithTitle(window_title)[0]
+
+            try:
+                ppt_window.restore()
+                ppt_window.activate()
+            except Exception as e:
+                print(f"⚠️ Could not restore PowerPoint editor: {e}")
+
+            time.sleep(0.8)
+            print("🔁 Slideshow not open, starting presentation now...")
+            pyautogui.press("f5")  # Start presentation
+            time.sleep(2)
+
+            # Try again to focus slideshow window
+            all_titles = gw.getAllTitles()
+            slide_windows = [t for t in all_titles if any(k.lower() in t.lower() for k in keywords_slideshow)]
+            if slide_windows:
+                slide_title = slide_windows[-1]
+                slide_window = gw.getWindowsWithTitle(slide_title)[0]
+                slide_window.activate()
+                print(f"✅ Focused newly started slideshow: {slide_title}")
+                return True
+
+        # 3️⃣ Final fallback: use Alt+Tab and try to start slideshow
+        print("⚠️ PowerPoint slideshow not found, using fallback...")
+        pyautogui.keyDown("alt")
+        pyautogui.press("tab")
+        pyautogui.keyUp("alt")
+        time.sleep(0.5)
+        pyautogui.press("f5")
+        print("✅ Started slideshow via fallback")
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Could not refocus PowerPoint slideshow: {e}")
+        return False
 # -----------------Intent Recognition System----------------------
 class IntentRecognizer:
     def __init__(self):
@@ -395,7 +977,9 @@ class IntentRecognizer:
             'pause presentation', 'return to presentation', 'come back', 'bring presentation back',
             'continue presentation'
             ],
-            'open_app': ['open app', 'launch app', 'start app', 'open application', 'run', 'open program', 'start program']
+            'open_app': ['open app', 'launch app', 'start app', 'open application', 'run', 'open program', 'start program'],
+            'click_action': ['click', 'click on', 'double click', 'select', 'press', 'open this','tap',
+                            'choose', 'scroll and click', 'click the second', 'click the third']
 
         }
         return training_data
@@ -480,7 +1064,9 @@ class IntentRecognizer:
             'increase zoom', 'decrease zoom', 'make it bigger', 'make it smaller',
             'full screen', 'exit full screen', 'first slide', 'last slide',
             'skip to slide', 'show slide number'],
-            'open_app': ['open app', 'launch', 'start', 'run']
+            'open_app': ['open app', 'launch', 'start', 'run'],
+            'click_action': ['click', 'click on', 'double click', 'tap', 'press',
+            'select', 'choose']
 
         }
         
@@ -494,98 +1080,11 @@ class IntentRecognizer:
 # Initialize intent recognizer
 intent_recognizer = IntentRecognizer()
 
-def minimize_browser_windows():
-    """Minimize Chrome, Edge, or Firefox windows if open."""
-    import pygetwindow as gw
-
-    browsers = ["Google Chrome", "Chrome", "Microsoft Edge", "Edge", "Firefox", "Mozilla Firefox"]
-    try:
-        all_titles = gw.getAllTitles()
-        for title in all_titles:
-            if any(b.lower() in title.lower() for b in browsers):
-                try:
-                    win = gw.getWindowsWithTitle(title)[0]
-                    win.minimize()
-                    print(f"🪟 Minimized browser: {title}")
-                except Exception as e:
-                    print(f"⚠️ Could not minimize {title}: {e}")
-    except Exception as e:
-        print(f"⚠️ Error minimizing browser windows: {e}")
 
 
-def focus_powerpoint():
-    """Bring PowerPoint slideshow (not editor) into focus."""
-    import pygetwindow as gw
-    import pyautogui
-    import time
 
-    pyautogui.press("esc")
-
-    try:
-        keywords_slideshow = ["Slide Show", "PowerPoint Slide Show"]
-        keywords_editor = ["PowerPoint", "Microsoft PowerPoint", "Presentation"]
-
-        # Get all open windows
-        all_titles = gw.getAllTitles()
-        print(f"All open windows: {all_titles}")
-
-        # 1️⃣ Try to find slideshow window first
-        slide_windows = [t for t in all_titles if any(k.lower() in t.lower() for k in keywords_slideshow)]
-
-        if slide_windows:
-            # Focus existing slideshow window
-            window_title = slide_windows[-1]
-            ppt_window = gw.getWindowsWithTitle(window_title)[0]
-
-            ppt_window.restore()
-            ppt_window.activate()
-            time.sleep(0.5)
-            print(f"✅ Focused PowerPoint slideshow: {window_title}")
-            return True
-
-        # 2️⃣ If slideshow window not found, try to find PowerPoint editor and start slideshow
-        ppt_windows = [t for t in all_titles if any(k.lower() in t.lower() for k in keywords_editor)]
-
-        if ppt_windows:
-            window_title = ppt_windows[-1]
-            ppt_window = gw.getWindowsWithTitle(window_title)[0]
-
-            try:
-                ppt_window.restore()
-                ppt_window.activate()
-            except Exception as e:
-                print(f"⚠️ Could not restore PowerPoint editor: {e}")
-
-            time.sleep(0.8)
-            print("🔁 Slideshow not open, starting presentation now...")
-            pyautogui.press("f5")  # Start presentation
-            time.sleep(2)
-
-            # Try again to focus slideshow window
-            all_titles = gw.getAllTitles()
-            slide_windows = [t for t in all_titles if any(k.lower() in t.lower() for k in keywords_slideshow)]
-            if slide_windows:
-                slide_title = slide_windows[-1]
-                slide_window = gw.getWindowsWithTitle(slide_title)[0]
-                slide_window.activate()
-                print(f"✅ Focused newly started slideshow: {slide_title}")
-                return True
-
-        # 3️⃣ Final fallback: use Alt+Tab and try to start slideshow
-        print("⚠️ PowerPoint slideshow not found, using fallback...")
-        pyautogui.keyDown("alt")
-        pyautogui.press("tab")
-        pyautogui.keyUp("alt")
-        time.sleep(0.5)
-        pyautogui.press("f5")
-        print("✅ Started slideshow via fallback")
-        return True
-
-    except Exception as e:
-        print(f"⚠️ Could not refocus PowerPoint slideshow: {e}")
-        return False
-
-
+def is_double_click_command(text):
+    return "double" in text.lower()
 
 
 # ------------------Functions----------------------
@@ -659,6 +1158,25 @@ def extract_entity(text, intent):
             text_lower
         )
         return cleaned.strip() if cleaned.strip() else None
+    
+    elif intent == 'click_action':
+        text = text_lower
+
+        # Remove click-related words
+        remove_words = [
+            "double click", "click on", "click", "tap", "press", 
+            "select", "choose"
+        ]
+
+        for w in remove_words:
+            text = text.replace(w, "")
+
+        # Remove meaningless fillers
+        filler = ["the", "this", "that", "a", "an", "please"]
+        words = [w for w in text.split() if w not in filler]
+
+        # The entity (target) must be the last meaningful words
+        return " ".join(words).strip()
 
     
     elif intent == 'presentation_control':
@@ -677,6 +1195,10 @@ def extract_entity(text, intent):
         return command if command and len(command) > 1 else text_lower
 
     return None
+
+
+
+    
 
 
 
@@ -890,13 +1412,7 @@ def handle_location(place):
 #             reply(f'Error accessing directory: {e}')
             
 def handle_open_file_path(name):
-    """
-    Open files or folders by natural names:
-    - 'downloads', 'desktop', 'documents', 'c drive', 'd drive'
-    - filename (searches common user folders)
-    - full path (if provided)
-    - 'recent <type>' opens recent files
-    """
+    
     if not name:
         reply("Which file or folder should I open?")
         return
@@ -1118,7 +1634,8 @@ def handle_open_app(app_name):
     if not app_name:
         reply("Which application should I open?")
         return
-
+    if open_taskbar_app(app_name):
+        return
     result = open_system_app(app_name)
     reply(result)
 
@@ -1226,6 +1743,16 @@ def handle_presentation_control(command):
         print(f"Presentation control error: {e}")
         reply("Sorry, I couldn’t control the presentation right now.")
 
+def handle_click_action(entity, full_cmd):
+    if not entity:
+        reply("What should I click on?")
+        return
+    
+    perform_click_action(
+        entity=entity,
+        is_double=is_double_click_command(full_cmd),
+        full_cmd=full_cmd
+    )
 
 # Executes Commands (input: string)
 def respond(voice_data):
@@ -1304,6 +1831,9 @@ def respond(voice_data):
     elif intent == 'open_app':
         handle_open_app(entity)
 
+    elif intent == 'click_action':
+        handle_click_action(entity, processed_voice)
+
     
     else:
         # Fallback for unknown intents
@@ -1328,6 +1858,8 @@ if __name__ == "__main__":
         print("Chatbot failed to start within expected time")
     else:
         print("Chatbot started successfully")
+
+    print(get_taskbar_buttons())    
 
     wish()
     
