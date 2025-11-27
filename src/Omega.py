@@ -8,6 +8,7 @@ from pynput.keyboard import Key, Controller
 import pyautogui
 import sys
 import os
+import psutil
 from os import listdir
 from os.path import isfile, join, exists
 import wikipedia
@@ -87,21 +88,65 @@ current_chrome_tab_id = None
 
 
 def chrome_get_tabs():
-    """Return Chrome debugging browser & list of tabs."""
+    """Return Chromium DevTools connection & list of tabs (any Chromium browser)."""
     try:
-        import socket
-        ip = socket.gethostbyname(socket.gethostname())
-
-        # fallback to localhost if no LAN IP
-        if ip.startswith("127."):
-            ip = "127.0.0.1"
-
-        browser = pychrome.Browser(url=f"http://{ip}:9223")
-        return browser, browser.list_tab()
+        # Debugging ALWAYS listens on localhost, not LAN
+        browser = pychrome.Browser(url="http://127.0.0.1:9223")
+        tabs = browser.list_tab()
+        return browser, tabs
     except:
         return None, []
 
+def ensure_chrome_debugging():
+    """
+    Upgraded version:
+    Ensures ANY Chromium-based browser (Chrome, Edge, Brave, Opera)
+    is running with remote debugging enabled at port 9223.
+    """
+    import psutil
+    import subprocess
+    import time
+    import os
 
+    # Supported Chromium browsers and their possible paths
+    browser_paths = [
+        # Chrome
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+
+        # Edge
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+
+        # Brave
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+
+        # Opera
+        fr"C:\Users\{os.getlogin()}\AppData\Local\Programs\Opera\launcher.exe",
+    ]
+
+    # 1. Check if ANY browser process is already running WITH debugging enabled
+    for proc in psutil.process_iter(['name', 'cmdline']):
+        try:
+            pname = proc.info['name'] or ""
+            cmd = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
+
+            if any(b in pname.lower() for b in ["chrome", "msedge", "brave", "opera"]):
+                if "--remote-debugging-port=9223" in cmd:
+                    return True  # Already enabled
+        except:
+            pass
+
+    # 2. If debugging is NOT running, launch the FIRST available browser
+    for path in browser_paths:
+        if os.path.exists(path):
+            print(f"Launching browser with debugging enabled: {path}")
+            subprocess.Popen([path, "--remote-debugging-port=9223"])
+            time.sleep(2)
+            return True
+
+    print("No Chromium browsers found to enable debugging.")
+    return False
 
 def get_all_installed_apps():
     """
@@ -581,52 +626,84 @@ def minimize_browser_windows():
     except Exception as e:
         print(f"⚠️ Error minimizing browser windows: {e}")
 
+import pytesseract
+from pytesseract import Output
+from PIL import ImageGrab
+import pyautogui
+import time
+from difflib import SequenceMatcher
+
+last_tab_boxes = []
+last_tab_target = None
+
 def chrome_switch_tab_by_name(name):
     global last_chrome_tab_id, current_chrome_tab_id
+    global last_tab_boxes, last_tab_target
 
-    browser, tabs = chrome_get_tabs()
-    if not tabs:
-        reply("Chrome is not running with debugging enabled.")
+    name = name.lower().strip()
+
+    # Capture only top area where tabs live
+    screen = ImageGrab.grab()
+    w, h = screen.size
+    tab_region = screen.crop((0, 0, w, 120))
+
+    data = pytesseract.image_to_data(tab_region, output_type=Output.DICT)
+
+    matches = []  # list of (x, y, w, h)
+
+    for i, txt in enumerate(data["text"]):
+        if not txt.strip():
+            continue
+
+        tab_text = txt.lower().strip()
+        score = SequenceMatcher(None, name, tab_text).ratio()
+
+        # fuzzy or direct match
+        if name in tab_text or score > 0.55:
+            x = data["left"][i]
+            y = data["top"][i]
+            w_box = data["width"][i]
+            h_box = data["height"][i]
+            matches.append((x, y, w_box, h_box))
+
+    # No matches
+    if not matches:
+        reply(f"I couldn't find a tab named {name}.")
         return False
 
-    name = name.lower()
+    # MULTIPLE matches → show options
+    if len(matches) > 1:
+        last_tab_boxes = matches
+        last_tab_target = name
+        show_numbered_boxes(matches)
+        reply("I found multiple matching tabs. Say 'choose 1', 'choose 2', etc.")
+        return True
 
-    # Find a tab by title
-    for tab in tabs:
-        title = tab.title.lower()
-        if name in title:
-            last_chrome_tab_id = current_chrome_tab_id
-            current_chrome_tab_id = tab.id
+    # Exactly one match → click it immediately
+    x, y, w_box, h_box = matches[0]
+    cx = x + w_box // 2
+    cy = y + h_box // 2
 
-            tab.start()
-            tab.call_method("Page.bringToFront")
-            reply(f"Switched to tab: {tab.title}")
-            return True
+    pyautogui.moveTo(cx, cy, duration=0.2)
+    pyautogui.click()
 
-    reply("No tab found with that name.")
-    return False
+    last_chrome_tab_id = current_chrome_tab_id
+    current_chrome_tab_id = name
+
+    reply(f"Switched to tab: {name}")
+    return True
 
 def chrome_return_to_previous_tab():
+    """
+    Return to previously clicked tab (OCR-based).
+    """
     global last_chrome_tab_id
+
     if not last_chrome_tab_id:
         reply("No previous tab recorded.")
         return False
 
-    browser, tabs = chrome_get_tabs()
-    if not tabs:
-        reply("Chrome debugging is not active.")
-        return False
-
-    for tab in tabs:
-        if tab.id == last_chrome_tab_id:
-            tab.start()
-            tab.call_method("Page.bringToFront")
-            reply("Returned to your previous tab.")
-            return True
-
-    reply("Previous tab is no longer available.")
-    return False
-
+    return chrome_switch_tab_by_name(last_chrome_tab_id)
 overlay_window = None
 overlay_labels = []
 import tkinter as tk
@@ -1726,42 +1803,58 @@ def handle_search(query):
 
 def handle_choice_selection(num):
     global last_found_boxes, last_click_target_text
+    global last_tab_boxes, last_tab_target
 
+    # ----------------- CASE 1: TAB SELECTION -----------------
+    if last_tab_boxes:
+        index = num - 1
+        if index < 0 or index >= len(last_tab_boxes):
+            reply("Invalid option number.")
+            return
+
+        clear_on_screen_boxes()
+
+        x, y, w, h = last_tab_boxes[index]
+        cx = x + w // 2
+        cy = y + h // 2
+
+        pyautogui.moveTo(cx, cy, duration=0.2)
+        pyautogui.click()
+
+        reply(f"Switched to tab: option {num}.")
+
+        # update memory for "previous tab"
+        global last_chrome_tab_id, current_chrome_tab_id
+        last_chrome_tab_id = current_chrome_tab_id
+        current_chrome_tab_id = last_tab_target
+
+        last_tab_boxes = []
+        last_tab_target = None
+        return
+
+    # ----------------- CASE 2: NORMAL CLICK SELECTION -----------------
     if not last_found_boxes:
         reply("No options available to choose from.")
         return
 
     index = num - 1
-
     if index < 0 or index >= len(last_found_boxes):
         reply("Invalid option number.")
         return
 
-    # Remove the overlay first
     clear_on_screen_boxes()
 
     x, y, w, h = last_found_boxes[index]
 
-    # --------------------------------------------------
-    # DOUBLE-CLICK if this target was a FILE
-    # --------------------------------------------------
-    try:
-        if looks_like_file_name(last_click_target_text):
-            pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
-            pyautogui.doubleClick()
-            reply(f"Opened file (option {num}).")
-        else:
-            # Normal UI element → single click
-            pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
-            pyautogui.click()
-            reply(f"Selected option {num}.")
-    except Exception:
-        # Fallback single-click if something unexpected happens
+    if looks_like_file_name(last_click_target_text):
+        pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
+        pyautogui.doubleClick()
+        reply(f"Opened file (option {num}).")
+    else:
         pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
         pyautogui.click()
         reply(f"Selected option {num}.")
 
-    # Clear memory
     last_found_boxes = []
     last_click_target_text = None
 
