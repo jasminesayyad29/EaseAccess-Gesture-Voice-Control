@@ -38,11 +38,13 @@ import win32gui
 import win32con
 import win32api
 import pythoncom
+import pychrome
 
 
 # Keep track of where we came from so we can return if needed
 last_context = None   # possible values: None, 'presentation', 'browser', ...
 AUTO_RETURN_AFTER_SEARCH = False # Set True if you want automatic return after search
+last_found_boxes = []
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -77,6 +79,27 @@ is_awake = True  # Bot status
 current_directory = 'C://'  # Track current directory
 import winreg
 import glob
+
+
+# Chrome Tab Memory
+last_chrome_tab_id = None
+current_chrome_tab_id = None
+
+
+def chrome_get_tabs():
+    """Return Chrome debugging browser & list of tabs."""
+    try:
+        import socket
+        ip = socket.gethostbyname(socket.gethostname())
+
+        # fallback to localhost if no LAN IP
+        if ip.startswith("127."):
+            ip = "127.0.0.1"
+
+        browser = pychrome.Browser(url=f"http://{ip}:9223")
+        return browser, browser.list_tab()
+    except:
+        return None, []
 
 
 
@@ -558,196 +581,600 @@ def minimize_browser_windows():
     except Exception as e:
         print(f"⚠️ Error minimizing browser windows: {e}")
 
-# place these module-level cache vars near the top of your module/file
-_ocr_image_cache = {"image_hash": None, "data": None}
+def chrome_switch_tab_by_name(name):
+    global last_chrome_tab_id, current_chrome_tab_id
 
-_ocr_cache = {"img_hash": None, "data": None}
+    browser, tabs = chrome_get_tabs()
+    if not tabs:
+        reply("Chrome is not running with debugging enabled.")
+        return False
+
+    name = name.lower()
+
+    # Find a tab by title
+    for tab in tabs:
+        title = tab.title.lower()
+        if name in title:
+            last_chrome_tab_id = current_chrome_tab_id
+            current_chrome_tab_id = tab.id
+
+            tab.start()
+            tab.call_method("Page.bringToFront")
+            reply(f"Switched to tab: {tab.title}")
+            return True
+
+    reply("No tab found with that name.")
+    return False
+
+def chrome_return_to_previous_tab():
+    global last_chrome_tab_id
+    if not last_chrome_tab_id:
+        reply("No previous tab recorded.")
+        return False
+
+    browser, tabs = chrome_get_tabs()
+    if not tabs:
+        reply("Chrome debugging is not active.")
+        return False
+
+    for tab in tabs:
+        if tab.id == last_chrome_tab_id:
+            tab.start()
+            tab.call_method("Page.bringToFront")
+            reply("Returned to your previous tab.")
+            return True
+
+    reply("Previous tab is no longer available.")
+    return False
+
+overlay_window = None
+overlay_labels = []
+import tkinter as tk
+
+def show_on_screen_boxes(boxes):
+    global overlay_window, overlay_labels
+
+    # Close old overlay if exists
+    if overlay_window:
+        overlay_window.destroy()
+
+    overlay_window = tk.Tk()
+    overlay_window.attributes("-topmost", True)
+    overlay_window.attributes("-transparentcolor", "white")
+    overlay_window.overrideredirect(True)
+
+    screen_w = overlay_window.winfo_screenwidth()
+    screen_h = overlay_window.winfo_screenheight()
+
+    overlay_window.geometry(f"{screen_w}x{screen_h}+0+0")
+    overlay_window.config(bg="white")
+
+    overlay_labels = []
+
+    for i, (x, y, w, h) in enumerate(boxes):
+        label = tk.Label(
+            overlay_window,
+            text=str(i+1),
+            bg="yellow",
+            fg="black",
+            font=("Arial", 14, "bold")
+        )
+        label.place(x=x + w//2, y=y - 20)  # draw above the box
+        overlay_labels.append(label)
+
+    overlay_window.update()
+
+def clear_on_screen_boxes():
+    global overlay_window
+    if overlay_window:
+        overlay_window.destroy()
+        overlay_window = None
+
+
+def show_numbered_boxes(boxes):
+    """
+    Provides visual feedback for multiple OCR matches.
+    Shows list in console and voice.
+    """
+    for i, (x, y, w, h) in enumerate(boxes):
+        print(f"Option {i+1}: ({x}, {y}, {w}, {h})")
+
+    show_on_screen_boxes(boxes)
+    reply("I found multiple matches. Say 'choose 1', 'choose 2', etc.")
+
 
 def find_text_boxes(target, fuzzy_threshold=0.65):
     """
-    Accurate OCR text finder for both:
-    - SINGLE WORDS (primary, unchanged behavior)
-    - MULTI-WORD PHRASES (added, but isolated so single words are never affected)
-
-    No architecture changes.
-    Just accuracy fixes.
+    Full-screen OCR with improved accuracy and Chrome-specific fallback.
+    Keeps your original structure and parameters.
+    Behavior:
+      - Normalizes spoken numbers
+      - Word-level matching with OCR-error corrections
+      - Cluster splitting for horizontal groups
+      - Chrome-only high-contrast / sharpen fallback when first-pass fails
+      - Returns list of boxes as (x, y, w, h) in screen coordinates
     """
-
     from difflib import SequenceMatcher
     import re
+    import ctypes
+    import psutil
+    from PIL import ImageEnhance, ImageOps
 
     # ----------------------------
     # Normalize spoken numbers
     # ----------------------------
-    number_words = {
+    num_words = {
         "zero":"0","one":"1","two":"2","three":"3","four":"4","five":"5",
-        "six":"6","seven":"7","eight":"8","nine":"9","ten":"10"
+        "six":"6","seven":"7","eight":"8","nine":"9","ten":"10",
     }
+    if not isinstance(target, str):
+        return []
     parts = target.lower().strip().split()
-    target = " ".join([number_words.get(w, w) for w in parts]).strip()
-    target_words = target.split()
-
-    single_word_mode = (len(target_words) == 1)
-    multi_word_mode  = (len(target_words) >  1)
-
-    # Raise fuzzy threshold for short UI labels
-    if single_word_mode and len(target) <= 5:
-        fuzzy_threshold = max(fuzzy_threshold, 0.85)
-
+    target = " ".join([num_words.get(w, w) for w in parts]).strip()
     if not target:
         return []
 
+    # Short UI labels stricter
+    if len(target) <= 5:
+        fuzzy_threshold = max(fuzzy_threshold, 0.85)
+
     # ----------------------------
-    # 1. OCR CAPTURE
+    # Detect active window process (to enable Chrome mode)
+    # ----------------------------
+    chrome_mode = False
+    try:
+        # Get foreground window handle
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        proc = psutil.Process(pid.value)
+        proc_name = proc.name().lower()
+        # enable chrome mode only for chrome/edge/brave
+        if any(x in proc_name for x in ("chrome", "msedge", "brave", "opera")):
+            chrome_mode = True
+        # ensure PowerPoint unaffected
+        if "powerpnt" in proc_name or "powerpoint" in proc_name:
+            chrome_mode = False
+    except Exception:
+        chrome_mode = False
+
+    # ----------------------------
+    # helper: OCR normalization corrections
+    # ----------------------------
+    def fix_ocr_token(w):
+        """Common char confusions and some chrome-specific patterns."""
+        s = w.replace("|", "i").replace("l", "i").replace("1", "i")
+        s = s.replace("0", "o").replace("5", "s").replace("$", "s")
+        # chrome-specific common misreads
+        s = s.replace("rn", "m").replace("vv", "w").replace("cl", "d")
+        s = s.replace("¬", "t")
+        return s
+
+    # ----------------------------
+    # 1) Capture screen (first pass)
     # ----------------------------
     img = ImageGrab.grab()
     data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
 
-    # ----------------------------
-    # Helper: Fix OCR errors
-    # ----------------------------
-    def fix_ocr(w):
-        return (
-            w.replace("1", "i")
-             .replace("l", "i")
-             .replace("|", "i")
-             .replace("0", "o")
-             .replace("5", "s")
-             .replace("$", "s")
-        )
+    # quick guard
+    n = len(data.get("text", []))
+    if n == 0:
+        return []
 
-    # ==========================================================
-    # MODE 1: HIGH-ACCURACY SINGLE WORD MATCHING
-    # ==========================================================
+    # ----------------------------
+    # 2) Word-level matching (high priority)
+    # ----------------------------
     word_hits = []
-    if single_word_mode:
-
-        for i, raw_word in enumerate(data["text"]):
-            if not raw_word.strip():
-                continue
-
-            word = raw_word.lower().strip()
-            fixed = fix_ocr(word)
-
-            x = data["left"][i]
-            y = data["top"][i]
-            w = data["width"][i]
-            h = data["height"][i]
-
-            # direct or substring
-            if target == word or target in word or word in target:
-                word_hits.append((x, y, w, h))
-                continue
-
-            # fuzzy raw
-            if SequenceMatcher(None, target, word).ratio() >= fuzzy_threshold:
-                word_hits.append((x, y, w, h))
-                continue
-
-            # fuzzy corrected
-            if SequenceMatcher(None, target, fixed).ratio() >= fuzzy_threshold:
-                word_hits.append((x, y, w, h))
-                continue
-
-        if word_hits:
-            return word_hits
-
-    # ==========================================================
-    # 2. ORIGINAL LINE GROUPING (UNCHANGED STRUCTURE)
-    # ==========================================================
-    lines = {}
-    for i, raw_word in enumerate(data["text"]):
-        if not raw_word.strip():
+    for i, w in enumerate(data["text"]):
+        if not w.strip():
             continue
-
-        block = data["block_num"][i]
-        ln = data["line_num"][i]
-        key = (block, ln)
+        w_raw = w.lower().strip()
+        w_fixed = fix_ocr_token(w_raw)
 
         x = data["left"][i]
         y = data["top"][i]
-        w = data["width"][i]
+        wid = data["width"][i]
+        h = data["height"][i]
+
+        # direct exact / substring
+        if target == w_raw or target in w_raw or w_raw in target:
+            word_hits.append((x, y, wid, h)); continue
+
+        # fuzzy on raw
+        if SequenceMatcher(None, target, w_raw).ratio() >= fuzzy_threshold:
+            word_hits.append((x, y, wid, h)); continue
+
+        # fuzzy on corrected token
+        if SequenceMatcher(None, target, w_fixed).ratio() >= fuzzy_threshold:
+            word_hits.append((x, y, wid, h)); continue
+
+    # If multi-token target and many token hits, return them to let click logic choose
+    target_tokens = target.split()
+    if len(target_tokens) > 1 and len(word_hits) >= max(1, len(target_tokens)//2):
+        return word_hits
+
+    # For single-word target, prefer word_hits immediately
+    if len(target_tokens) == 1 and word_hits:
+        return word_hits
+
+    # ----------------------------
+    # 3) Line grouping (preserve original structure)
+    # ----------------------------
+    lines = {}
+    for i, w in enumerate(data["text"]):
+        if not w.strip():
+            continue
+        block = data["block_num"][i]
+        line = data["line_num"][i]
+        key = (block, line)
+        x = data["left"][i]
+        y = data["top"][i]
+        wid = data["width"][i]
         h = data["height"][i]
 
         if key not in lines:
             lines[key] = {"words": [], "boxes": []}
-
-        lines[key]["words"].append(raw_word.lower())
-        lines[key]["boxes"].append((x, y, w, h))
+        lines[key]["words"].append(w.lower())
+        lines[key]["boxes"].append((x, y, wid, h))
 
     matches = []
 
-    # ==========================================================
-    # MODE 2: MULTI-WORD PHRASE MATCHING
-    # ==========================================================
-    for key, info in lines.items():
-
-        # cluster split (same as before)
+    # ----------------------------
+    # 4) Cluster splitting + matching
+    # ----------------------------
+    for (block, line), info in lines.items():
         entries = list(zip(info["words"], info["boxes"]))
-        entries.sort(key=lambda e: e[1][0])
+        entries.sort(key=lambda e: e[1][0])  # left->right
 
+        # split clusters by horizontal gap
         clusters = []
-        cluster = [entries[0]]
+        if entries:
+            cur = [entries[0]]
+            for i in range(1, len(entries)):
+                prev_x, prev_w = entries[i-1][1][0], entries[i-1][1][2]
+                curr_x = entries[i][1][0]
+                gap = curr_x - (prev_x + prev_w)
+                if gap < 50:
+                    cur.append(entries[i])
+                else:
+                    clusters.append(cur)
+                    cur = [entries[i]]
+            clusters.append(cur)
 
-        for i in range(1, len(entries)):
-            prev_x, prev_w = entries[i-1][1][0], entries[i-1][1][2]
-            curr_x = entries[i][1][0]
-            gap = curr_x - (prev_x + prev_w)
-
-            if gap < 50:
-                cluster.append(entries[i])
-            else:
-                clusters.append(cluster)
-                cluster = [entries[i]]
-
-        clusters.append(cluster)
-
-        # Evaluate clusters
         for cluster in clusters:
-
-            text = " ".join([w for w, _ in cluster])
-
+            cl_text = " ".join([c[0] for c in cluster])
             xs = [b[0] for _, b in cluster]
             ys = [b[1] for _, b in cluster]
             ws = [b[2] for _, b in cluster]
             hs = [b[3] for _, b in cluster]
-
-            x1 = min(xs)
-            y1 = min(ys)
+            x1 = min(xs); y1 = min(ys)
             x2 = max(xs[i] + ws[i] for i in range(len(ws)))
             y2 = max(ys[i] + hs[i] for i in range(len(hs)))
             box = (x1, y1, x2 - x1, y2 - y1)
 
-            # ---------------------
-            # MULTI-WORD LOGIC
-            if multi_word_mode:
+            # direct phrase substring
+            if target in cl_text:
+                matches.append(box); continue
 
-                # direct phrase substring
-                if target in text:
-                    matches.append(box)
+            # fuzzy phrase match
+            if SequenceMatcher(None, target, cl_text).ratio() >= fuzzy_threshold:
+                matches.append(box); continue
+
+            # token-level majority
+            token_hits = sum(1 for t in target_tokens if t in cl_text)
+            if token_hits >= max(1, len(target_tokens)//2):
+                matches.append(box); continue
+
+    # If matches found on first pass, return
+    if matches:
+        return matches
+
+    # ----------------------------
+    # 5) CHROME-SPECIFIC SECOND PASS (only when chrome_mode)
+    # ----------------------------
+    if chrome_mode:
+        try:
+            # produce enhanced image: grayscale -> autocontrast -> enhance contrast/sharpness
+            enh = img.convert("L")
+            enh = ImageOps.autocontrast(enh)
+            enh = ImageEnhance.Contrast(enh).enhance(1.8)
+            enh = ImageEnhance.Sharpness(enh).enhance(2.0)
+            # re-run OCR on enhanced image
+            data2 = pytesseract.image_to_data(enh, output_type=pytesseract.Output.DICT)
+            n2 = len(data2.get("text", []))
+            if n2 == 0:
+                return []
+            # repeat word-level and cluster matching but with extra token corrections
+            word_hits2 = []
+            for i in range(n2):
+                raw = (data2["text"][i] or "").strip()
+                if not raw:
                     continue
+                wr = raw.lower()
+                # extra chrome fixes
+                wf = fix_ocr_token(wr)
+                # also a cleaned variant removing spaces inside tokens (case: "govern ance")
+                wf2 = re.sub(r"\s+", "", wr)
 
-                # fuzzy entire phrase
-                if SequenceMatcher(None, target, text).ratio() >= fuzzy_threshold:
-                    matches.append(box)
+                x = data2["left"][i]
+                y = data2["top"][i]
+                wid = data2["width"][i]
+                h = data2["height"][i]
+
+                if target == wr or target in wr or wr in target:
+                    word_hits2.append((x, y, wid, h)); continue
+                if SequenceMatcher(None, target, wr).ratio() >= fuzzy_threshold:
+                    word_hits2.append((x, y, wid, h)); continue
+                if SequenceMatcher(None, target, wf).ratio() >= fuzzy_threshold:
+                    word_hits2.append((x, y, wid, h)); continue
+                if SequenceMatcher(None, target, wf2).ratio() >= fuzzy_threshold:
+                    word_hits2.append((x, y, wid, h)); continue
+
+            if word_hits2:
+                return word_hits2
+
+            # cluster pass for enhanced OCR data
+            lines2 = {}
+            for i in range(n2):
+                raw = (data2["text"][i] or "").strip()
+                if not raw:
                     continue
+                blk = data2["block_num"][i]
+                ln = data2["line_num"][i]
+                key = (blk, ln)
+                x = data2["left"][i]
+                y = data2["top"][i]
+                wid = data2["width"][i]
+                h = data2["height"][i]
+                if key not in lines2:
+                    lines2[key] = {"words": [], "boxes": []}
+                lines2[key]["words"].append(raw.lower())
+                lines2[key]["boxes"].append((x, y, wid, h))
 
-                # token-level majority match
-                token_hits = sum(1 for t in target_words if t in text)
-                if token_hits >= max(1, len(target_words)//2):
-                    matches.append(box)
+            matches2 = []
+            for key, info in lines2.items():
+                entries = list(zip(info["words"], info["boxes"]))
+                entries.sort(key=lambda e: e[1][0])
+                if not entries:
                     continue
+                # cluster split
+                clusters2 = []
+                cur = [entries[0]]
+                for i in range(1, len(entries)):
+                    prev_x, prev_w = entries[i-1][1][0], entries[i-1][1][2]
+                    curr_x = entries[i][1][0]
+                    gap = curr_x - (prev_x + prev_w)
+                    if gap < 50:
+                        cur.append(entries[i])
+                    else:
+                        clusters2.append(cur)
+                        cur = [entries[i]]
+                clusters2.append(cur)
 
-            # ---------------------
-            # FALLBACK SINGLE-WORD LOGIC
-            if single_word_mode:
-                if target in text:
-                    matches.append(box)
-                    continue
-                if SequenceMatcher(None, target, text).ratio() >= fuzzy_threshold:
-                    matches.append(box)
+                for cluster in clusters2:
+                    text = " ".join([c[0] for c in cluster])
+                    xs = [b[0] for _, b in cluster]
+                    ys = [b[1] for _, b in cluster]
+                    ws = [b[2] for _, b in cluster]
+                    hs = [b[3] for _, b in cluster]
+                    x1 = min(xs); y1 = min(ys)
+                    x2 = max(xs[i] + ws[i] for i in range(len(ws)))
+                    y2 = max(ys[i] + hs[i] for i in range(len(hs)))
+                    box = (x1, y1, x2 - x1, y2 - y1)
 
+                    if target in text:
+                        matches2.append(box); continue
+                    if SequenceMatcher(None, target, text).ratio() >= fuzzy_threshold:
+                        matches2.append(box); continue
+                    # try corrected token comparison
+                    tclean = re.sub(r"\s+", "", text)
+                    if SequenceMatcher(None, target.replace(" ", ""), tclean).ratio() >= 0.85:
+                        matches2.append(box); continue
+
+            if matches2:
+                return matches2
+
+        except Exception:
+            # if anything breaks in chrome fallback, silently ignore and return []
+            pass
+
+    # end chrome fallbackhan
     return matches
+
+
+def looks_like_file_name(text):
+    """Detect if target appears to be a file or folder."""
+    file_exts = [
+        ".pdf", ".docx", ".xlsx", ".xls", ".pptx",
+        ".png", ".jpg", ".jpeg", ".zip", ".rar",
+        ".txt", ".py", ".csv", ".mp4", ".mp3"
+    ]
+    t = text.lower()
+    if any(ext in t for ext in file_exts):
+        return True
+    
+    # folder-like (no spaces, no dots)
+    if " " not in t and "." not in t and len(t) <= 20:
+        return True
+    
+    return False
+
+def parse_choice_number(text):
+    text = text.lower().strip()
+
+    number_words = {
+        "one":1, "first":1, "1":1, "1st":1,
+        "two":2, "second":2, "2":2, "2nd":2,
+        "three":3, "third":3, "3":3, "3rd":3,
+        "four":4, "fourth":4, "4":4, "4th":4,
+        "five":5, "fifth":5, "5":5, "5th":5
+    }
+
+    for word, num in number_words.items():
+        if word in text:
+            return num
+
+    # fallback: digit detection
+    digits = ''.join([ch for ch in text if ch.isdigit()])
+    if digits.isdigit():
+        return int(digits)
+
+    return None
+
+
+def perform_click_action(entity, is_double=False, full_cmd=""):
+    """
+    FINAL version:
+     - Multi-match disambiguation
+     - File/folder auto double-click
+     - nth occurrence support
+     - URL/Domain fallback
+     - Region targeting (top left, bottom right)
+     - Avoid browser tabs unless explicitly allowed
+     - Uses your full find_text_boxes() engine
+    """
+    import re
+    global last_found_boxes
+
+    target = entity.lower().strip()
+
+    # normalize spoken numbers
+    num_map = {
+        "zero":"0","one":"1","two":"2","three":"3","four":"4","five":"5",
+        "six":"6","seven":"7","eight":"8","nine":"9","ten":"10"
+    }
+    target = " ".join([num_map.get(w, w) for w in target.split()]).strip()
+
+    reply(f"Searching for {target}...")
+
+    # 1. OCR for initial matches
+    boxes = find_text_boxes(target)
+
+    # nth occurrence detection
+    index = 0
+    mapping = {
+        "first":0,"1st":0,"second":1,"2nd":1,"third":2,"3rd":2,
+        "fourth":3,"4th":3,"fifth":4,"5th":4
+    }
+    for w in full_cmd.lower().split():
+        if w in mapping:
+            index = mapping[w]
+
+    # URL-like handling
+    is_url_like = False
+    url_candidate = None
+    if re.match(r"(https?://)|www\.", entity.lower()) or (("." in entity) and (" " not in entity.strip())):
+        is_url_like = True
+        url_candidate = entity.lower().strip()
+        dom = re.sub(r"^https?://", "", url_candidate)
+        dom = dom.split("/")[0]
+        dom_token = dom.replace("www.", "").split(".")[0]
+    else:
+        dom_token = None
+
+    # 2. scroll + retry
+    if not boxes:
+        boxes = scroll_and_find(target)
+
+    # domain-token fallback
+    if not boxes and is_url_like and dom_token:
+        boxes = find_text_boxes(dom_token)
+
+    # link fallback
+    if not boxes and ("link" in full_cmd.lower() or "open link" in full_cmd.lower()) and dom_token:
+        boxes = find_text_boxes(dom_token)
+
+    if not boxes:
+        reply(f"I could not find {entity} on the screen.")
+        return
+
+
+    # --------------------------------------------------
+    # MULTIPLE MATCHES → list them & wait for user choice
+    # --------------------------------------------------
+    if len(boxes) > 1:
+        global last_click_target_text
+        last_click_target_text = entity   # remember what the user wanted to click
+        last_found_boxes = boxes
+        show_numbered_boxes(boxes)
+        return
+
+
+
+    # --------------------------------------------------
+    # 3. REGION TARGETING (top left, top right, etc.)
+    # --------------------------------------------------
+    cmd = full_cmd.lower()
+
+    # “top right”
+    if "top right" in cmd:
+        boxes = sorted(boxes, key=lambda b: (b[1], -b[0]))
+
+    elif "top left" in cmd:
+        boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+
+    elif "bottom right" in cmd:
+        boxes = sorted(boxes, key=lambda b: (-b[1], -b[0]))
+
+    elif "bottom left" in cmd:
+        boxes = sorted(boxes, key=lambda b: (-b[1], b[0]))
+
+
+    # --------------------------------------------------
+    # AVOID CLICKING TOP BROWSER BAR (TABS)
+    # unless user said “top”
+    # --------------------------------------------------
+    if "top" not in cmd:
+        filtered = [b for b in boxes if b[1] > 80]   # ignore any box within top 80px
+        if filtered:
+            boxes = filtered
+
+
+    # --------------------------------------------------
+    # ICON MODE (unchanged)
+    # --------------------------------------------------
+    if "icon" in cmd:
+        icon_name = entity + ".png"
+        icon_path = os.path.join("icons", icon_name)
+        box = find_icon_on_screen(icon_path)
+        if box:
+            x, y, w, h = box
+            pyautogui.moveTo(x + w//2, y + h//2, duration=0.2)
+            pyautogui.doubleClick() if is_double else pyautogui.click()
+            reply("Icon clicked.")
+            return
+        reply("Icon not found.")
+        return
+
+
+    # --------------------------------------------------
+    # If STILL no boxes (edge-case)
+    # --------------------------------------------------
+    if not boxes:
+        reply(f"I could not find {entity} on the screen.")
+        return
+
+
+    # --------------------------------------------------
+    # 4. FILE/FOLDER → AUTO DOUBLE CLICK
+    # --------------------------------------------------
+    x, y, w, h = boxes[index]
+
+    if looks_like_file_name(entity):
+        pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
+        pyautogui.doubleClick()
+        reply("Opened.")
+        return
+
+
+    # --------------------------------------------------
+    # 5. NORMAL CLICK (UI elements)
+    # --------------------------------------------------
+    pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
+    pyautogui.doubleClick() if is_double else pyautogui.click()
+    reply("Done.")
+
 
 def scroll_and_find(target, max_scrolls=20):
     """Scroll the screen and search for text."""
@@ -758,66 +1185,6 @@ def scroll_and_find(target, max_scrolls=20):
         pyautogui.scroll(-800)  # scroll down
         time.sleep(0.3)
     return []
-
-def perform_click_action(entity, is_double=False, full_cmd=""):
-    target = entity.lower().strip()
-
-    # Normalize number words
-    num_map = {
-        "zero":"0","one":"1","two":"2","three":"3","four":"4","five":"5",
-        "six":"6","seven":"7","eight":"8","nine":"9","ten":"10"
-    }
-    parts = target.split()
-    target = " ".join([num_map.get(w, w) for w in parts])
-
-    reply(f"Searching for {target}...")
-
-    # 1. Try exact/partial text match
-    boxes = find_text_boxes(target)
-
-    # Detect nth occurrence
-    index = 0
-    mapping = {
-        "first":0,"1st":0,
-        "second":1,"2nd":1,
-        "third":2,"3rd":2,
-        "fourth":3,"4th":3
-    }
-
-    for w in full_cmd.lower().split():
-        if w in mapping:
-            index = mapping[w]
-
-    # 2. If not visible → scroll
-    if not boxes:
-        boxes = scroll_and_find(target)
-
-    if not boxes:
-        reply(f"I could not find {entity} on the screen.")
-        return
-
-    # 3. Region targeting
-    cmd = full_cmd.lower()
-    if "top right" in cmd:
-        boxes = sorted(boxes, key=lambda b: (b[1], -b[0]))
-    elif "top left" in cmd:
-        boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
-    elif "bottom right" in cmd:
-        boxes = sorted(boxes, key=lambda b: (-b[1], -b[0]))
-    elif "bottom left" in cmd:
-        boxes = sorted(boxes, key=lambda b: (-b[1], b[0]))
-
-    # 6. Choose match by index
-    try:
-        x, y, w, h = boxes[index]
-    except:
-        x, y, w, h = boxes[0]
-
-    # Final click
-    pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
-    pyautogui.doubleClick() if is_double else pyautogui.click()
-
-    reply("Done.")
 
 def focus_powerpoint():
     """Bring PowerPoint slideshow (not editor) into focus."""
@@ -890,6 +1257,8 @@ def focus_powerpoint():
     except Exception as e:
         print(f"⚠️ Could not refocus PowerPoint slideshow: {e}")
         return False
+
+
 # -----------------Intent Recognition System----------------------
 class IntentRecognizer:
     def __init__(self):
@@ -967,19 +1336,27 @@ class IntentRecognizer:
                 'wake up omega', 'start listening', 'activate omega'
             ],
             'presentation_control': [
-            'next slide', 'previous slide', 'go back a slide', 'go to next slide',
-            'show next', 'show previous', 'start presentation', 'begin slideshow',
-            'end presentation', 'stop presentation', 'pause presentation',
-            'resume presentation', 'exit slideshow', 'zoom in', 'zoom out',
-            'increase zoom', 'decrease zoom', 'make it bigger', 'make it smaller',
-            'go full screen', 'exit full screen', 'move to first slide',
-            'go to last slide', 'skip to slide', 'show slide number','resume presentation',
-            'pause presentation', 'return to presentation', 'come back', 'bring presentation back',
-            'continue presentation'
+                'next slide', 'previous slide', 'go back a slide', 'go to next slide',
+                'show next', 'show previous', 'start presentation', 'begin slideshow',
+                'end presentation', 'stop presentation', 'pause presentation',
+                'resume presentation', 'exit slideshow', 'zoom in', 'zoom out',
+                'increase zoom', 'decrease zoom', 'make it bigger', 'make it smaller',
+                'go full screen', 'exit full screen', 'move to first slide',
+                'go to last slide', 'skip to slide', 'show slide number','resume presentation',
+                'pause presentation', 'return to presentation', 'come back', 'bring presentation back',
+                'continue presentation','highlight','scroll', 'find', 'search on page'
             ],
             'open_app': ['open app', 'launch app', 'start app', 'open application', 'run', 'open program', 'start program'],
             'click_action': ['click', 'click on', 'double click', 'select', 'press', 'open this','tap',
-                            'choose', 'scroll and click', 'click the second', 'click the third']
+                'choose', 'scroll and click', 'click the second', 'click the third'
+            ],
+            'tab_control': [
+                'switch tab', 'switch to tab', 'go to tab', 'open tab',
+                'change tab', 'previous tab', 'next tab', 'back to tab'
+            ],
+
+            
+
 
         }
         return training_data
@@ -1051,7 +1428,7 @@ class IntentRecognizer:
             'location': ['location', 'map', 'where is', 'locate'],
             'files': ['file', 'files', 'directory', 'folder', 'list'],
             'open_file_path': ['open file', 'open folder', 'directory', 'folder', 'file'],
-            'file_navigate': ['back', 'previous', 'go back', 'up'],
+            'file_navigate': ['back', 'previous', 'go back'],
             'goodbye': ['bye', 'goodbye', 'exit', 'quit'],
             'copy': ['copy', 'copy this'],
             'paste': ['paste', 'paste it'],
@@ -1063,18 +1440,24 @@ class IntentRecognizer:
             'resume presentation', 'exit slideshow', 'zoom in', 'zoom out',
             'increase zoom', 'decrease zoom', 'make it bigger', 'make it smaller',
             'full screen', 'exit full screen', 'first slide', 'last slide',
-            'skip to slide', 'show slide number'],
+            'skip to slide', 'show slide number','highlight','scroll', 'find', 'search on page'],
             'open_app': ['open app', 'launch', 'start', 'run'],
             'click_action': ['click', 'click on', 'double click', 'tap', 'press',
-            'select', 'choose']
+            'select', 'choose'],
+            'tab_control': ['switch tab', 'switch to', 'open tab', 'go to tab','change tab', 'next tab', 'previous tab', 'back to tab'],
+            'choice_select': ['choose', 'option', 'select number', 'number'],
 
         }
         
+        import re
+
         for intent, keywords in intent_keywords.items():
             for keyword in keywords:
-                if keyword in text_lower:
+                # Match whole words only
+                pattern = rf'\b{re.escape(keyword)}\b'
+                if re.search(pattern, text_lower):
                     return intent
-        
+
         return 'unknown'
 
 # Initialize intent recognizer
@@ -1177,8 +1560,20 @@ def extract_entity(text, intent):
 
         # The entity (target) must be the last meaningful words
         return " ".join(words).strip()
-
     
+    elif intent == 'tab_control':
+        # Remove trigger words
+        text = text_lower
+        remove = ["switch", "to", "tab", "open", "go", "back", "previous", "next"]
+        words = [w for w in text.split() if w not in remove]
+        return " ".join(words).strip()
+
+    elif intent == 'choice_select':
+    # return exactly what user said, like "option 4"
+        return text_lower
+
+
+        
     elif intent == 'presentation_control':
         # Remove the wake word and common filler words, but keep "slide"
         control_words = ['omega', 'presentation', 'slideshow', 'powerpoint', 'keynote', 'please','to the', 'to presentation', 'back to']
@@ -1196,42 +1591,6 @@ def extract_entity(text, intent):
 
     return None
 
-
-
-    
-
-
-
-# def open_file_or_folder(full_path):
-#     """Open a file or folder using the appropriate method"""
-#     try:
-#         if exists(full_path):
-#             if isfile(full_path):
-#                 # It's a file - open it with default application
-#                 os.startfile(full_path)
-#                 return f"Opened file: {os.path.basename(full_path)}"
-#             else:
-#                 # It's a folder - navigate into it
-#                 global current_directory, files, file_exp_status
-#                 current_directory = full_path
-#                 files = listdir(current_directory)
-                
-#                 # Display new directory contents
-#                 filestr = ""
-#                 counter = 0
-#                 for f in files:
-#                     counter += 1
-#                     item_type = "file" if isfile(join(current_directory, f)) else "folder"
-#                     filestr += f"{counter}: {f} ({item_type})<br>"
-#                     print(f"{counter}: {f} ({item_type})")
-                
-#                 file_exp_status = True
-#                 app.ChatBot.addAppMsg(filestr)
-#                 return f"Opened folder: {os.path.basename(full_path)}"
-#         else:
-#             return f"Path does not exist: {full_path}"
-#     except Exception as e:
-#         return f"Error opening: {str(e)}"
 
 def navigate_back():
     """Navigate to parent directory"""
@@ -1365,6 +1724,58 @@ def handle_search(query):
         if temp_audio:
             handle_search(temp_audio)
 
+def handle_choice_selection(num):
+    global last_found_boxes, last_click_target_text
+
+    if not last_found_boxes:
+        reply("No options available to choose from.")
+        return
+
+    index = num - 1
+
+    if index < 0 or index >= len(last_found_boxes):
+        reply("Invalid option number.")
+        return
+
+    # Remove the overlay first
+    clear_on_screen_boxes()
+
+    x, y, w, h = last_found_boxes[index]
+
+    # --------------------------------------------------
+    # DOUBLE-CLICK if this target was a FILE
+    # --------------------------------------------------
+    try:
+        if looks_like_file_name(last_click_target_text):
+            pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
+            pyautogui.doubleClick()
+            reply(f"Opened file (option {num}).")
+        else:
+            # Normal UI element → single click
+            pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
+            pyautogui.click()
+            reply(f"Selected option {num}.")
+    except Exception:
+        # Fallback single-click if something unexpected happens
+        pyautogui.moveTo(x + w//2, y + h//2, duration=0.25)
+        pyautogui.click()
+        reply(f"Selected option {num}.")
+
+    # Clear memory
+    last_found_boxes = []
+    last_click_target_text = None
+
+def handle_tab_control(entity):
+    if not entity:
+        reply("Which tab should I switch to?")
+        return
+
+    entity = entity.lower()
+
+    if "previous" in entity or "back" in entity:
+        chrome_return_to_previous_tab()
+    else:
+        chrome_switch_tab_by_name(entity)
 
 
 def handle_location(place):
@@ -1390,26 +1801,7 @@ def handle_location(place):
             except:
                 reply('Please check your internet connection')
 
-# def handle_files(operation, voice_data):
-#     """Handle file listing"""
-#     global file_exp_status, files, current_directory
-    
-#     if operation == 'list' or not operation:
-#         counter = 0
-#         current_directory = 'C://'
-#         try:
-#             files = listdir(current_directory)
-#             filestr = ""
-#             for f in files:
-#                 counter += 1
-#                 item_type = "file" if isfile(join(current_directory, f)) else "folder"
-#                 filestr += f"{counter}: {f} ({item_type})<br>"
-#                 print(f"{counter}: {f} ({item_type})")
-#             file_exp_status = True
-#             reply('These are the files in your root directory')
-#             app.ChatBot.addAppMsg(filestr)
-#         except Exception as e:
-#             reply(f'Error accessing directory: {e}')
+
             
 def handle_open_file_path(name):
     
@@ -1576,28 +1968,6 @@ def handle_open_file_path(name):
     return
 
 
-
-# def handle_file_open(file_number, voice_data):
-#     """Handle file/folder opening by number"""
-#     global file_exp_status, files, current_directory
-    
-#     if not file_exp_status:
-#         reply("Please list files first using 'list files' command")
-#         return
-    
-#     try:
-#         if file_number and 1 <= file_number <= len(files):
-#             file_index = file_number - 1
-#             selected_item = files[file_index]
-#             full_path = join(current_directory, selected_item)
-            
-#             result = open_file_or_folder(full_path)
-#             reply(result)
-#         else:
-#             reply(f"Please specify a valid file number between 1 and {len(files)}")
-#     except Exception as e:
-#         reply(f"Error opening file: {str(e)}")
-
 def handle_file_navigate(operation):
     """Handle file navigation"""
     if operation == 'back':
@@ -1640,13 +2010,8 @@ def handle_open_app(app_name):
     reply(result)
 
 
-def handle_presentation_control(command):
-    """
-    Handle presentation control commands such as:
-    next slide, previous slide, start presentation, end presentation,resume presentation etc.
-    """
-    command = command.lower().strip()
 
+def handle_presentation_control(command):
     try:
         # Match against common variations of user commands
         if any(kw in command for kw in ["next", "forward", "advance"]):
@@ -1723,6 +2088,38 @@ def handle_presentation_control(command):
             else:
                 reply("I couldn't find the presentation window to return to.")
 
+        elif any(kw in command for kw in ["highlight", "find", "search on page"]):
+            phrase = None
+
+            # Extract text after the first keyword that appears
+            for kw in ["highlight", "find", "search for"]:
+                if kw in command:
+                    phrase = command.split(kw, 1)[1].strip()
+                    break
+
+            if phrase:
+                pyautogui.hotkey("ctrl", "f")
+                time.sleep(0.2)
+                pyautogui.typewrite(phrase)
+                pyautogui.press("enter")
+                reply(f"Highlighted {phrase}")
+            else:
+                reply("What should I highlight?")
+            return True
+
+
+        # Scroll down
+        elif any(kw in command for kw in ["scroll down", "go down", "move down"]):
+            pyautogui.scroll(-700)
+            reply("Scrolling down.")
+            return True
+
+        # Scroll up
+        elif any(kw in command for kw in ["scroll up", "go up", "move up"]):
+            pyautogui.scroll(700)
+            reply("Scrolling up.")
+            return True
+
         
         elif any(kw in command for kw in ["slide", "skip to slide", "go to slide"]):
             # Extract slide number if mentioned
@@ -1760,7 +2157,7 @@ def respond(voice_data):
     
     if not voice_data:
         return
-        
+       
     print(f"Processing: {voice_data}")
     
     # Store original for display
@@ -1770,6 +2167,13 @@ def respond(voice_data):
     processed_voice = voice_data.replace('omega', '').strip()
     app.ChatBot.addUserMsg(original_voice_data)
 
+    pv = processed_voice.lower()
+
+        # Force Tab Control
+    if "switch" in pv and "tab" in pv:
+        entity = extract_entity(processed_voice, "tab_control")
+        handle_tab_control(entity)
+        return
     # Check if bot is asleep
     if not is_awake:
         intent = intent_recognizer.predict_intent(processed_voice)
@@ -1825,11 +2229,21 @@ def respond(voice_data):
     elif intent == 'wake_up':
         handle_wake_up()
 
+    elif intent == 'choice_select':
+        num = parse_choice_number(entity)
+        if num:
+            handle_choice_selection(num)
+        else:
+            reply("Please say a valid option number like choose one or choose 2.")
+
     elif intent == 'presentation_control':
         handle_presentation_control(entity)
     
     elif intent == 'open_app':
         handle_open_app(entity)
+
+    elif intent == 'tab_control':
+        handle_tab_control(entity)
 
     elif intent == 'click_action':
         handle_click_action(entity, processed_voice)
