@@ -551,7 +551,7 @@ class GestureController:
         
         finally:
             if self.cap:
-                self.cap.relAura()
+                self.cap.relOmega()
             cv2.destroyAllWindows()
             print("Gesture Controller stopped.")
 

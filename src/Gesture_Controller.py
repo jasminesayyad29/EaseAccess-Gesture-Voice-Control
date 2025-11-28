@@ -643,7 +643,7 @@ def start(self):
             if cv2.waitKey(5) & 0xFF == 13:
                 break
     
-    GestureController.cap.relAura()
+    GestureController.cap.relOmega()
     cv2.destroyAllWindows()
 # uncomment to run directly
 gc1 = GestureController()

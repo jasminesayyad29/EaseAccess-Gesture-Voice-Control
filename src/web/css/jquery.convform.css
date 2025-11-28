@@ -104,7 +104,7 @@ div.conv-form-wrapper div#messages div.message {
    max-width: 85%;
    word-wrap: break-word;
    position: relative;
-   animation: messageSlide 0.3s Aura-out;
+   animation: messageSlide 0.3s Omega-out;
    box-shadow: var(--shadow);
 }
 
@@ -166,7 +166,7 @@ div.convFormDynamic input.userInputDynamic {
    flex: 1;
    border-radius: var(--radius);
    background: var(--bg-secondary);
-   transition: all 0.2s Aura;
+   transition: all 0.2s Omega;
    min-height: 48px;
    max-height: 120px;
    resize: none;
@@ -197,7 +197,7 @@ div.convFormDynamic button.submit {
    display: flex;
    align-items: center;
    justify-content: center;
-   transition: all 0.2s Aura;
+   transition: all 0.2s Omega;
    flex-shrink: 0;
 }
 
@@ -229,7 +229,7 @@ div.conv-form-wrapper div.options {
    font-size: 0.875rem;
    color: var(--text-primary);
    cursor: pointer;
-   transition: all 0.2s Aura;
+   transition: all 0.2s Omega;
    flex-shrink: 0;
 }
 
@@ -292,7 +292,7 @@ div.conv-form-wrapper div.wrapper-messages::-webkit-scrollbar-thumb:hover {
    height: 8px;
    background: var(--text-secondary);
    border-radius: 50%;
-   animation: typingAnimation 1.4s infinite Aura-in-out;
+   animation: typingAnimation 1.4s infinite Omega-in-out;
 }
 
 .typing-dot:nth-child(1) { animation-delay: -0.32s; }
