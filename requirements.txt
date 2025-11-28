@@ -1,28 +1,28 @@
-pyttsx3==2.71
+pyttsx3==2.99
 SpeechRecognition==3.8.1
-pynput==1.7.3
-pyautogui==0.9.53
+pynput==1.8.1
+PyAutoGUI==0.9.54
 wikipedia==1.4.0
-
-# OpenCV (stable with Python 3.9 + Mediapipe 0.8.x)
-opencv-python==4.6.0.66
-
-comtypes==1.1.11
-pycaw==20181226
-screen-brightness-control==0.9.0
-eel==0.14.0
-
-# Add these essential packages for gesture control:
-tensorflow==2.10.0
+numpy==1.23.5
+scikit-learn==1.7.2
+joblib==1.5.2
+pytesseract==0.3.13
+pillow==12.0.0
+opencv-python==4.12.0.88
+opencv-contrib-python==4.12.0.88
+PyGetWindow==0.0.9
+psutil==7.1.2
+pychrome==0.2.4
 mediapipe==0.10.5
-
-# Force NumPy to stay below 2.x
-numpy<2.0
-
+tensorflow==2.10.0
 protobuf==3.20.3
-
-# Add this to your requirements.txt
-PyAudio==0.2.11
-
-joblib==1.2.0
-scikit-learn==1.0.2
+Eel==0.14.0
+screen-brightness-control==0.9.0
+pycaw==20181226
+comtypes==1.4.13
+pypiwin32==223
+pywin32==311
+PyAudio==0.2.14
+sounddevice==0.5.3
+matplotlib==3.10.7
+requests==2.32.5
