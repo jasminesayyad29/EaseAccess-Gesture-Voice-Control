@@ -47,6 +47,13 @@ last_context = None   # possible values: None, 'presentation', 'browser', ...
 AUTO_RETURN_AFTER_SEARCH = False # Set True if you want automatic return after search
 last_found_boxes = []
 
+paste_word_mode = None        # None, "before", or "after"
+paste_word_boxes = []         # boxes of the matched word(s)
+paste_word_target = None      # the word like "stay" / "save"
+
+paste_position_mode = None      
+paste_position_boxes = []
+
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # -------------Object Initialization---------------
@@ -635,6 +642,17 @@ from difflib import SequenceMatcher
 
 last_tab_boxes = []
 last_tab_target = None
+# ----------------- RANGE SELECTION STATE (Independent) -----------------
+range_mode = None              # "select" or "copy" or None
+range_phase = None             # "start" or "end" or None
+range_start_phrase = ""
+range_end_phrase = ""
+
+range_start_occurrences = []   # OCR boxes for the start phrase
+range_end_occurrences = []     # OCR boxes for the end phrase
+
+range_selected_start = None    # selected start OCR box (x, y, w, h)
+
 
 def chrome_switch_tab_by_name(name):
     global last_chrome_tab_id, current_chrome_tab_id
@@ -1059,6 +1077,396 @@ def find_text_boxes(target, fuzzy_threshold=0.65):
     # end chrome fallbackhan
     return matches
 
+def move_caret_after_phrase(phrase: str):
+    """
+    Move text cursor (caret) to just AFTER the given phrase using OCR.
+    """
+    phrase = phrase.strip().lower()
+    if not phrase:
+        reply("After which word should I paste?")
+        return False
+
+    boxes = find_text_boxes(phrase)
+    if not boxes:
+        reply(f"I couldn't find {phrase} on the screen.")
+        return False
+
+    x, y, w, h = boxes[0]
+
+    # click AFTER the word
+    click_x = x + w + 5
+    click_y = y + h // 2
+
+    try:
+        pyautogui.click(click_x, click_y)
+        time.sleep(0.1)
+        return True
+    except Exception as e:
+        print(f"move_caret_after_phrase error: {e}")
+        reply("I couldn't move the cursor after that word.")
+        return False
+
+
+def move_caret_before_phrase(phrase: str):
+    """
+    Move caret to just BEFORE the given phrase using OCR.
+    """
+    phrase = phrase.strip().lower()
+    if not phrase:
+        reply("Before which word should I paste?")
+        return False
+
+    boxes = find_text_boxes(phrase)
+    if not boxes:
+        reply(f"I couldn't find {phrase} on the screen.")
+        return False
+
+    x, y, w, h = boxes[0]
+
+    # Click slightly to the LEFT of the word so caret is before it
+    click_x = max(x - 5, 0)
+    click_y = y + h // 2
+
+    try:
+        pyautogui.click(click_x, click_y)
+        time.sleep(0.1)
+        return True
+    except Exception as e:
+        print(f"move_caret_before_phrase error: {e}")
+        reply("I couldn't move the cursor before that word.")
+        return False
+
+
+def move_caret_to_line_start_for_phrase(phrase: str):
+    """
+    Move caret to the START of the line containing the phrase.
+    """
+    phrase = phrase.strip().lower()
+    if not phrase:
+        reply("Which line should I paste at the start of?")
+        return False
+
+    boxes = find_text_boxes(phrase)
+    if not boxes:
+        reply(f"I couldn't find {phrase} on the screen.")
+        return False
+
+    x, y, w, h = boxes[0]
+
+    # Far left on the same line
+    click_x = max(x - 200, 0)
+    click_y = y + h // 2
+
+    try:
+        pyautogui.click(click_x, click_y)
+        time.sleep(0.1)
+        return True
+    except Exception as e:
+        print(f"move_caret_to_line_start_for_phrase error: {e}")
+        reply("I couldn't move the cursor to the start of that line.")
+        return False
+
+
+def move_caret_to_line_end_for_phrase(phrase: str):
+    """
+    Move caret to the END of the line / paragraph containing the phrase.
+    """
+    phrase = phrase.strip().lower()
+    if not phrase:
+        reply("Which line or paragraph end should I paste at?")
+        return False
+
+    boxes = find_text_boxes(phrase)
+    if not boxes:
+        reply(f"I couldn't find {phrase} on the screen.")
+        return False
+
+    x, y, w, h = boxes[0]
+
+    # Far right after the phrase on the same line
+    click_x = x + w + 200
+    click_y = y + h // 2
+
+    try:
+        pyautogui.click(click_x, click_y)
+        time.sleep(0.1)
+        return True
+    except Exception as e:
+        print(f"move_caret_to_line_end_for_phrase error: {e}")
+        reply("I couldn't move the cursor to the end of that line.")
+        return False
+
+
+def move_to_excel_cell(cell_ref: str):
+    """
+    Move selection to a specific Excel cell (e.g., A5, B10) using Go To (Ctrl+G).
+    Assumes Excel is focused.
+    """
+    cell_ref = cell_ref.strip().upper()
+    if not cell_ref:
+        reply("Which cell should I paste into?")
+        return False
+
+    try:
+        # Open 'Go To' dialog
+        with keyboard.pressed(Key.ctrl):
+            keyboard.press('g')
+            keyboard.release('g')
+
+        time.sleep(0.2)
+        pyautogui.typewrite(cell_ref)
+        pyautogui.press('enter')
+        time.sleep(0.2)
+        return True
+    except Exception as e:
+        print(f"move_to_excel_cell error: {e}")
+        reply("I couldn't jump to that cell. Make sure Excel is active.")
+        return False
+
+def apply_range_selection(start_box, end_box, mode, start_phrase, end_phrase):
+    """
+    Given two OCR boxes and a mode:
+      - 'select' → just select range
+      - 'copy'   → select range + Ctrl+C
+    """
+    global range_mode, range_phase
+    global range_start_occurrences, range_end_occurrences
+    global range_start_phrase, range_end_phrase, range_selected_start
+
+    try:
+        sx, sy, sw, sh = start_box
+        ex, ey, ew, eh = end_box
+
+        # 0) Small safety pause
+        time.sleep(0.1)
+
+        # 1) Click at start (this also focuses the underlying window)
+        # Click slightly to the *left* of the OCR box so caret goes to the start of the word
+        start_x = max(sx - 5, 0)
+        start_y = sy + sh // 2
+
+        pyautogui.click(start_x, start_y)
+        time.sleep(0.15)
+
+        # 2) Shift+click at end to extend selection
+        end_x = ex + ew - 3
+        end_y = ey + eh // 2
+        pyautogui.keyDown('shift')
+        pyautogui.click(end_x, end_y)
+        pyautogui.keyUp('shift')
+        time.sleep(0.15)
+
+        # 3) Optional copy
+        if mode == 'copy':
+            with keyboard.pressed(Key.ctrl):
+                keyboard.press('c')
+                keyboard.release('c')
+            reply(f"Copied text from {start_phrase} to {end_phrase}.")
+        else:
+            reply(f"Selected text from {start_phrase} to {end_phrase}.")
+
+    except Exception as e:
+        print(f"apply_range_selection error: {e}")
+        reply("I couldn't select that text range.")
+
+    # Reset range state
+    range_mode = None
+    range_phase = None
+    range_start_occurrences = []
+    range_end_occurrences = []
+    range_start_phrase = ""
+    range_end_phrase = ""
+    range_selected_start = None
+    clear_on_screen_boxes()
+
+def start_range_selection(full_cmd: str, mode: str):
+    """
+    Common logic for:
+      - 'select from X to Y'  (mode='select')
+      - 'copy from X to Y'    (mode='copy')
+
+    If multiple matches for start or end, it will:
+      - show numbered boxes,
+      - then wait for 'choose N' (handled by handle_range_choice).
+    """
+    global range_mode, range_phase
+    global range_start_phrase, range_end_phrase
+    global range_start_occurrences, range_end_occurrences
+    global range_selected_start
+
+    text = full_cmd.lower()
+    m = re.search(r'from (.+?) to (.+)', text)
+    if not m:
+        if mode == 'copy':
+            reply("Please say something like: copy from <start> to <end>.")
+        else:
+            reply("Please say something like: select from <start> to <end>.")
+        return
+
+    start_phrase = m.group(1).strip()
+    end_phrase = m.group(2).strip()
+
+    if not start_phrase or not end_phrase:
+        reply("I need both a start and an end phrase.")
+        return
+
+    # OCR search
+    start_boxes = find_text_boxes(start_phrase)
+    if not start_boxes:
+        reply(f"I couldn't find the phrase {start_phrase} on the screen.")
+        return
+
+    end_boxes = find_text_boxes(end_phrase)
+    if not end_boxes:
+        reply(f"I couldn't find the phrase {end_phrase} on the screen.")
+        return
+
+    # Reset/initialize state
+    range_mode = mode
+    range_phase = None
+    range_start_phrase = start_phrase
+    range_end_phrase = end_phrase
+    range_start_occurrences = start_boxes
+    range_end_occurrences = end_boxes
+    range_selected_start = None
+
+    # Case 1: unique start & unique end → execute immediately
+    if len(start_boxes) == 1 and len(end_boxes) == 1:
+        apply_range_selection(start_boxes[0], end_boxes[0], mode, start_phrase, end_phrase)
+        return
+
+    # Case 2: ambiguous start (multiple occurrences)
+    if len(start_boxes) > 1:
+        range_phase = "start"
+        show_numbered_boxes(start_boxes)
+        reply("I found multiple matches for the start phrase. Say 'choose 1', 'choose 2', etc.")
+        return
+
+    # Case 3: unique start, ambiguous end
+    range_selected_start = start_boxes[0]
+    range_phase = "end"
+    show_numbered_boxes(end_boxes)
+    reply("I found multiple matches for the end phrase. Say 'choose 1', 'choose 2', etc.")
+
+def select_text_range_by_phrases(start_phrase: str, end_phrase: str):
+    """
+    Use OCR to select text on screen from start_phrase up to end_phrase.
+    Works in editors/browsers where text is visually rendered.
+
+    Returns True if selection likely succeeded, False otherwise.
+    """
+    if not start_phrase or not end_phrase:
+        reply("I need both a start and an end phrase.")
+        return False
+
+    start_phrase = start_phrase.strip().lower()
+    end_phrase = end_phrase.strip().lower()
+
+    # 1) Find start phrase boxes
+    start_boxes = find_text_boxes(start_phrase)
+    if not start_boxes:
+        reply(f"I couldn't find the phrase {start_phrase} on the screen.")
+        return False
+
+    # 2) Find end phrase boxes
+    end_boxes = find_text_boxes(end_phrase)
+    if not end_boxes:
+        reply(f"I couldn't find the phrase {end_phrase} on the screen.")
+        return False
+
+    # For now: use the first occurrence of each
+    sx, sy, sw, sh = start_boxes[0]
+    ex, ey, ew, eh = end_boxes[0]
+
+    # 3) Click at the start phrase (left side, vertically centered)
+    start_x = sx + 3
+    start_y = sy + sh // 2
+
+    # 4) Click end phrase while holding Shift, so we select everything
+    #    between them (direction doesn't really matter; selection will be from anchor to this click)
+    end_x = ex + ew - 3
+    end_y = ey + eh // 2
+
+    try:
+        # First click: set caret at start
+        pyautogui.click(start_x, start_y)
+        time.sleep(0.1)
+
+        # Second click with Shift held: extend selection to end
+        pyautogui.keyDown('shift')
+        pyautogui.click(end_x, end_y)
+        pyautogui.keyUp('shift')
+
+        return True
+    except Exception as e:
+        print(f"select_text_range_by_phrases error: {e}")
+        reply("I couldn't select that text range.")
+        return False
+
+def get_all_ocr_boxes():
+    """
+    Use the SAME OCR pipeline we already use for find_text_boxes(),
+    but return ALL detected word boxes (no text matching).
+    """
+    try:
+        # 1) Capture full screen using your accurate capturer
+        img = capture_screen_region(0, 0, screen_width, screen_height)
+
+        # 2) Preprocess using your pipeline for accuracy
+        processed = preprocess_image(img)
+
+        # 3) Run OCR with your existing settings
+        data = pytesseract.image_to_data(processed, output_type=Output.DICT)
+
+        boxes = []
+        n = len(data.get("text", []))
+
+        for i in range(n):
+            txt = data["text"][i]
+            conf = int(data["conf"][i]) if data["conf"][i].isdigit() else -1
+
+            # skip empty or low-confidence words
+            if not txt or not txt.strip():
+                continue
+            if conf < 30:   # your normal threshold
+                continue
+
+            x = data["left"][i]
+            y = data["top"][i]
+            w = data["width"][i]
+            h = data["height"][i]
+
+            # skip tiny words/noise
+            if w < 10 or h < 10:
+                continue
+
+            boxes.append((x, y, w, h))
+
+        return boxes
+
+    except Exception as e:
+        print("get_all_ocr_boxes error:", e)
+        return []
+
+def start_paste_position_selection():
+    """
+    OCR the screen, show numbered boxes as possible paste positions,
+    and wait for the user to say 'choose 1', 'choose 2', etc.
+    """
+    global paste_position_mode, paste_position_boxes
+
+    boxes = get_all_ocr_boxes()
+    if not boxes:
+        reply("I couldn't find any paste positions on the screen.")
+        return
+
+    paste_position_boxes = boxes
+    paste_position_mode = "active"
+
+    # Reuse existing overlay system
+    show_numbered_boxes(paste_position_boxes)
+    reply("I found multiple paste positions. Say 'choose 1', 'choose 2', etc.")
+
 
 def looks_like_file_name(text):
     """Detect if target appears to be a file or folder."""
@@ -1401,9 +1809,11 @@ class IntentRecognizer:
                 'see you soon', 'i have to go'
             ],
             'copy': [
-                'copy', 'copy this', 'copy text', 'copy that', 'copy selected',
-                'copy to clipboard', 'copy the text', 'copy this text'
-            ],
+                    'copy from',
+                    'copy text from',
+                    'copy everything from',
+                    'copy data from',
+                ],
             'paste': [
                 'paste', 'paste it', 'paste here', 'paste text', 'paste that',
                 'paste from clipboard', 'paste the text', 'paste here please'
@@ -1431,8 +1841,61 @@ class IntentRecognizer:
                 'switch tab', 'switch to tab', 'go to tab', 'open tab',
                 'change tab', 'previous tab', 'next tab', 'back to tab'
             ],
+            'range_select': [
+                'select from', 
+                'select text from',
+                'select data from',
+                'highlight from',
+                'highlight text from',
+                'select everything from'
+            ],
+            'paste_after': [
+                'paste after',
+                'paste after this',
+                'paste after the word',
+                'insert after',
+                'insert text after',
+                'paste it after',
+                'paste immediately after',
+                'paste right after'
+            ],
 
-            
+            'paste_before': [
+                'paste before',
+                'paste before this',
+                'paste before the word',
+                'insert before',
+                'place text before',
+                'paste it before',
+                'paste right before'
+            ],
+
+            'paste_line_start': [
+                'paste at start of line',
+                'paste at the start of the line',
+                'insert at line start',
+                'place text at start of line',
+                'paste before the line starts'
+            ],
+
+            'paste_line_end': [
+                'paste at end of line',
+                'paste at the end of the line',
+                'insert at line end',
+                'place text at end of line',
+                'paste at end of paragraph',
+                'insert at end of paragraph'
+            ],
+
+            'paste_cell': [
+                'paste in cell',
+                'paste into cell',
+                'paste to cell',
+                'insert in cell',
+                'insert into cell',
+                'paste inside cell'
+            ],
+
 
 
         }
@@ -1507,7 +1970,7 @@ class IntentRecognizer:
             'open_file_path': ['open file', 'open folder', 'directory', 'folder', 'file'],
             'file_navigate': ['back', 'previous', 'go back'],
             'goodbye': ['bye', 'goodbye', 'exit', 'quit'],
-            'copy': ['copy', 'copy this'],
+            'copy': ['copy', 'copy this', 'copy text', 'copy from',],
             'paste': ['paste', 'paste it'],
             'wake_up': ['wake up', 'start', 'activate'],
             'presentation_control': [
@@ -1523,6 +1986,12 @@ class IntentRecognizer:
             'select', 'choose'],
             'tab_control': ['switch tab', 'switch to', 'open tab', 'go to tab','change tab', 'next tab', 'previous tab', 'back to tab'],
             'choice_select': ['choose', 'option', 'select number', 'number'],
+            'range_select': ['select from', 'select text from', 'highlight from'],
+            'paste_after': ['paste after', 'insert after', 'paste right after', 'paste immediately after'],
+            'paste_before': ['paste before', 'insert before', 'paste right before'],
+            'paste_line_start': [ 'start of line', 'paste at start', 'line start'],
+            'paste_line_end': ['end of line', 'end of paragraph', 'paste at end', 'line end' ],
+            'paste_cell': [ 'cell', 'paste in cell', 'paste into cell', 'insert in cell'],
 
         }
         
@@ -1607,9 +2076,10 @@ def extract_entity(text, intent):
         return 'back'
     
     elif intent == 'open_app':
-    # remove open keywords
-     name = re.sub(r'\b(open|launch|start|run|app|application|program)\b', '', text_lower).strip()
-     return name if name else None
+        # remove open keywords
+        name = re.sub(r'\b(open|launch|start|run|app|application|program)\b', '', text_lower).strip()
+        return name if name else None
+
 
     elif intent == 'files':
         cleaned = re.sub(
@@ -1648,6 +2118,43 @@ def extract_entity(text, intent):
     elif intent == 'choice_select':
     # return exactly what user said, like "option 4"
         return text_lower
+    
+    elif intent == 'range_select':
+        # whole command needed to extract "from X to Y"
+        return text_lower
+
+    elif intent == 'copy' and "from" in text_lower and "to" in text_lower:
+        # treat copy-from-to as range copy
+        return text_lower
+    
+    elif intent == 'paste_after':
+        text = text_lower
+        remove_words = ['paste', 'after', 'the', 'word', 'insert', 'text', 'right', 'immediately']
+        phrase = " ".join([w for w in text.split() if w not in remove_words]).strip()
+        return phrase if phrase else None
+
+    elif intent == 'paste_before':
+        text = text_lower
+        remove_words = ['paste', 'before', 'the', 'word', 'insert', 'text', 'right']
+        phrase = " ".join([w for w in text.split() if w not in remove_words]).strip()
+        return phrase if phrase else None
+
+    elif intent == 'paste_line_start':
+        text = text_lower
+        # extract phrase after "line"
+        m = re.search(r'line (.+)', text)
+        return m.group(1).strip() if m else None
+
+    elif intent == 'paste_line_end':
+        text = text_lower
+        # extract phrase after line/paragraph
+        m = re.search(r'(?:line|paragraph) (.+)', text)
+        return m.group(1).strip() if m else None
+
+    elif intent == 'paste_cell':
+        text = text_lower
+        m = re.search(r'cell\s+([a-z]+[0-9]+)', text)
+        return m.group(1).strip().upper() if m else None
 
 
         
@@ -1801,6 +2308,70 @@ def handle_search(query):
         if temp_audio:
             handle_search(temp_audio)
 
+def handle_range_choice(num: int):
+    """
+    Handles 'choose N' specifically for range selection (from X to Y).
+    Does NOT interfere with existing handle_choice_selection.
+    """
+    global range_mode, range_phase
+    global range_start_occurrences, range_end_occurrences
+    global range_selected_start
+    global range_start_phrase, range_end_phrase
+
+    # If not in a range-selection workflow, do nothing
+    if range_mode is None or range_phase is None:
+        return
+
+    index = num - 1
+
+    # -------------------- Choosing the start phrase --------------------
+    if range_phase == "start":
+        if index < 0 or index >= len(range_start_occurrences):
+            reply("Invalid option number for the start phrase.")
+            return
+
+        # Remove overlay so clicks hit the real document
+        clear_on_screen_boxes()
+        range_selected_start = range_start_occurrences[index]
+
+        # If multiple end matches → ask for them
+        if len(range_end_occurrences) > 1:
+            range_phase = "end"
+            show_numbered_boxes(range_end_occurrences)
+            reply("Now choose which ending phrase you want. Say 'choose 1', 'choose 2', etc.")
+            return
+
+        # Otherwise: apply immediately (unique end)
+        apply_range_selection(
+            range_selected_start,
+            range_end_occurrences[0],
+            range_mode,
+            range_start_phrase,
+            range_end_phrase
+        )
+        return
+
+    # -------------------- Choosing the end phrase --------------------
+    if range_phase == "end":
+        if index < 0 or index >= len(range_end_occurrences):
+            reply("Invalid option number for the end phrase.")
+            return
+
+        clear_on_screen_boxes()
+        end_box = range_end_occurrences[index]
+
+        # Edge case: if start wasn't set for some reason
+        if range_selected_start is None and range_start_occurrences:
+            range_selected_start = range_start_occurrences[0]
+
+        apply_range_selection(
+            range_selected_start,
+            end_box,
+            range_mode,
+            range_start_phrase,
+            range_end_phrase
+        )
+
 def handle_choice_selection(num):
     global last_found_boxes, last_click_target_text
     global last_tab_boxes, last_tab_target
@@ -1870,6 +2441,164 @@ def handle_tab_control(entity):
     else:
         chrome_switch_tab_by_name(entity)
 
+def handle_paste_after(full_cmd: str):
+    """
+    Advanced paste handler.
+
+    Supports:
+      - 'paste before <word>'
+      - 'paste after <word>'
+      (You can extend later for start/end of line / cell logic.)
+
+    Behavior:
+      - Use OCR to find <word> on screen
+      - If multiple matches -> show numbered options -> user says "choose N"
+      - Then move caret just before/after that word and paste, without selecting a range.
+    """
+    global paste_word_mode, paste_word_boxes, paste_word_target
+
+    text = full_cmd.lower()
+
+    # Detect "before" vs "after"
+    mode = None
+    if "paste before" in text or "before" in text:
+        mode = "before"
+    elif "paste after" in text or "after" in text:
+        mode = "after"
+
+    if mode not in ("before", "after"):
+        # For now, just fallback to simple paste if we don't recognize pattern
+        handle_paste()
+        return
+
+    # Extract the word/phrase after "before" or "after"
+    m = re.search(r'(before|after)\s+(.+)', text)
+    if not m:
+        reply("Please say 'paste before <word>' or 'paste after <word>'.")
+        return
+
+    target = m.group(2).strip()
+    if not target:
+        reply("I didn't catch the word after before/after.")
+        return
+
+    paste_word_target = target
+    paste_word_mode = mode
+
+    # Use your OCR engine to find this word on screen
+    boxes = find_text_boxes(target)
+    if not boxes:
+        paste_word_mode = None
+        paste_word_boxes = []
+        paste_word_target = None
+        reply(f"I couldn't find {target} on the screen.")
+        return
+
+    # If only one match → paste immediately
+    if len(boxes) == 1:
+        x, y, w, h = boxes[0]
+
+        if paste_word_mode == "before":
+            click_x = x + 2
+        else:  # "after"
+            click_x = x + w - 2
+
+        click_y = y + h // 2
+
+        pyautogui.click(click_x, click_y)
+        time.sleep(0.1)
+
+        with keyboard.pressed(Key.ctrl):
+            keyboard.press('v')
+            keyboard.release('v')
+
+        reply(f"Pasted {paste_word_mode} {target}.")
+        paste_word_mode = None
+        paste_word_boxes = []
+        paste_word_target = None
+        return
+
+    # Multiple matches → show options and wait for 'choose N'
+    paste_word_boxes = boxes
+    show_numbered_boxes(paste_word_boxes)
+    reply(f"I found multiple '{target}' positions. Say 'choose 1', 'choose 2', etc.")
+
+def handle_paste_position_choice(num: int):
+    """
+    When in paste_position_mode, user says 'choose N'.
+    Move caret to that box and paste from clipboard.
+    """
+    global paste_position_mode, paste_position_boxes
+
+    if paste_position_mode != "active":
+        return  # not in paste-position mode; let normal handler manage
+
+    index = num - 1
+    if index < 0 or index >= len(paste_position_boxes):
+        reply("Invalid option number.")
+        return
+
+    clear_on_screen_boxes()
+
+    x, y, w, h = paste_position_boxes[index]
+    click_x = x + w // 2
+    click_y = y + h // 2
+
+    # Click to move caret
+    pyautogui.click(click_x, click_y)
+    time.sleep(0.1)
+
+    # Paste from clipboard
+    with keyboard.pressed(Key.ctrl):
+        keyboard.press('v')
+        keyboard.release('v')
+
+    reply("Pasted at the selected position.")
+
+    # Reset state
+    paste_position_mode = None
+    paste_position_boxes = []
+
+def handle_paste_word_choice(num: int):
+    """
+    User said 'choose N' while we are in the paste_word_mode workflow.
+    Paste before/after the chosen occurrence of the word.
+    """
+    global paste_word_mode, paste_word_boxes, paste_word_target
+
+    if paste_word_mode not in ("before", "after") or not paste_word_boxes:
+        return  # not in word-paste mode, ignore
+
+    index = num - 1
+    if index < 0 or index >= len(paste_word_boxes):
+        reply("Invalid option number.")
+        return
+
+    clear_on_screen_boxes()
+
+    x, y, w, h = paste_word_boxes[index]
+
+    if paste_word_mode == "before":
+        click_x = x + 2
+    else:  # "after"
+        click_x = x + w - 2
+
+    click_y = y + h // 2
+
+    pyautogui.click(click_x, click_y)
+    time.sleep(0.1)
+
+    with keyboard.pressed(Key.ctrl):
+        keyboard.press('v')
+        keyboard.release('v')
+
+    reply(f"Pasted {paste_word_mode} {paste_word_target}.")
+
+    # Reset state
+    paste_word_mode = None
+    paste_word_boxes = []
+    paste_word_target = None
+   
 
 def handle_location(place):
     """Handle location intent"""
@@ -2080,6 +2809,11 @@ def handle_copy():
         keyboard.release('c')
     reply('Copied to clipboard')
 
+def handle_copy_range(full_cmd: str):
+    # Use shared range-selection engine (with disambiguation)
+    start_range_selection(full_cmd, mode="copy")
+
+
 def handle_paste():
     """Handle paste intent"""
     with keyboard.pressed(Key.ctrl):
@@ -2102,6 +2836,9 @@ def handle_open_app(app_name):
     result = open_system_app(app_name)
     reply(result)
 
+def handle_select_range(full_cmd: str):
+    # Use shared range-selection engine (with disambiguation)
+    start_range_selection(full_cmd, mode="select")
 
 
 def handle_presentation_control(command):
@@ -2314,20 +3051,64 @@ def respond(voice_data):
         handle_goodbye()
     
     elif intent == 'copy':
-        handle_copy()
+    
+        if "from" in processed_voice.lower() and "to" in processed_voice.lower():
+            handle_copy_range(processed_voice)
+        else:
+            handle_copy()
+
+    elif intent == 'range_select':
+        handle_select_range(processed_voice)
+
     
     elif intent == 'paste':
-        handle_paste()
-    
+        text = processed_voice.lower()
+
+        # 1️⃣ Optional: generic OCR-options paste (if you implemented start_paste_position_selection)
+        if "paste using options" in text or "paste at position" in text or "paste with options" in text:
+            start_paste_position_selection()
+
+        # 2️⃣ Word-based before/after/start/end/cell paste
+        elif any(kw in text for kw in ["after", "before", "start of line", "end of line", "end of paragraph", "cell "]):
+            handle_paste_after(processed_voice)
+
+        # 3️⃣ Simple paste at current caret
+        else:
+            handle_paste()
+
+    elif intent in ['paste_after', 'paste_before', 'paste_line_start', 'paste_line_end', 'paste_cell']:
+        handle_paste_after(processed_voice)
+
+
+
+
     elif intent == 'wake_up':
         handle_wake_up()
 
     elif intent == 'choice_select':
-        num = parse_choice_number(entity)
-        if num:
+            num = parse_choice_number(entity)
+            if not num:
+                reply("Please say a valid option number like choose one or choose two.")
+                return
+
+            # 1️⃣ Range selection workflow (copy/select text)
+            if range_mode is not None:
+                handle_range_choice(num)
+                return
+
+            # 2️⃣ Paste-position mode (generic options-based paste)
+            if paste_position_mode == "active":
+                handle_paste_position_choice(num)
+                return
+
+            # 3️⃣ Word-based paste-before/after workflow
+            if paste_word_mode is not None:
+                handle_paste_word_choice(num)
+                return
+
+            # 4️⃣ Otherwise, original behavior for click/tab/other choices
             handle_choice_selection(num)
-        else:
-            reply("Please say a valid option number like choose one or choose 2.")
+
 
     elif intent == 'presentation_control':
         handle_presentation_control(entity)
