@@ -372,7 +372,7 @@ def run_face_auth_standalone():
                 break
 
     finally:
-        cap.relAura()
+        cap.relOmega()
         cv2.destroyAllWindows()
         print("Face Authentication stopped.")
 
