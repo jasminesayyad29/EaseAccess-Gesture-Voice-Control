@@ -61,6 +61,14 @@ today = date.today()
 r = sr.Recognizer()
 keyboard = Controller()
 
+# Voice recognition tuning (balanced for noisy rooms)
+r.dynamic_energy_threshold = True
+r.dynamic_energy_adjustment_damping = 0.15
+r.dynamic_energy_ratio = 1.7
+r.pause_threshold = 0.8
+r.phrase_threshold = 0.25
+r.non_speaking_duration = 0.4
+
 # Initialize text-to-speech engine with error handling
 try:
     engine = pyttsx3.init('sapi5')
@@ -92,6 +100,79 @@ import glob
 # Chrome Tab Memory
 last_chrome_tab_id = None
 current_chrome_tab_id = None
+
+WAKE_WORD_VARIANTS = (
+    "omega", "oh mega", "o mega", "ome ga", "amiga", "omegaa"
+)
+
+COMMON_STT_FIXES = {
+    "search four": "search for",
+    "switch toe tab": "switch to tab",
+    "switch two tab": "switch to tab",
+    "go too tab": "go to tab",
+    "opun": "open",
+    "clik": "click",
+}
+
+APP_ALIAS_GROUPS = {
+    "chrome": ["chrome", "google chrome", "chrome.exe"],
+    "word": ["word", "microsoft word", "winword", "winword.exe"],
+    "powerpoint": ["powerpoint", "microsoft powerpoint", "power point", "powerpnt", "powerpnt.exe"],
+    "excel": ["excel", "microsoft excel", "excel.exe"],
+}
+
+APP_DIRECT_EXECUTABLES = {
+    "chrome": ["chrome.exe"],
+    "word": ["winword.exe"],
+    "powerpoint": ["powerpnt.exe"],
+    "excel": ["excel.exe"],
+}
+
+def normalize_voice_text(text):
+    """Normalize transcript to reduce STT noise before intent extraction."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    for wrong, right in COMMON_STT_FIXES.items():
+        cleaned = re.sub(rf"\b{re.escape(wrong)}\b", right, cleaned)
+    return cleaned
+
+def strip_wake_word(text):
+    """Remove wake-word variants from the beginning of a transcript."""
+    if not text:
+        return ""
+    output = text
+    for wake_word in WAKE_WORD_VARIANTS:
+        output = re.sub(rf"^\s*{re.escape(wake_word)}[\s,.:-]*", "", output, flags=re.IGNORECASE)
+    return output.strip()
+
+def normalize_app_query(text):
+    """Extract app name from variants like 'open chrome' and 'open app chrome'."""
+    if not text:
+        return ""
+    cleaned = normalize_voice_text(text)
+    cleaned = re.sub(
+        r"\b(open|launch|start|run|app|application|program|command|please|the)\b",
+        " ",
+        cleaned
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+def is_open_app_command(text):
+    """Detect app-open intent for plain 'open <app>' and 'open app <app>' forms."""
+    if not text:
+        return False
+    t = normalize_voice_text(text)
+    if not (t.startswith("open ") or t.startswith("launch ") or t.startswith("start ") or t.startswith("run ")):
+        return False
+
+    file_hints = {"file", "folder", "directory", "path", "documents", "downloads", "desktop", "pictures"}
+    words = set(t.split())
+    if words & file_hints:
+        return False
+    return True
 
 
 def chrome_get_tabs():
@@ -265,12 +346,12 @@ def get_all_installed_apps():
 def match_app(user_input, app_dict):
     """
     Return the matched key from app_dict (or None).
-    Matching order: exact -> startswith -> fuzzy
+    Matching order: exact -> startswith -> contains/tokens -> fuzzy
     """
     if not user_input:
         return None
 
-    name = user_input.lower().strip()
+    name = normalize_app_query(user_input)
     keys = list(app_dict.keys())
 
     # Exact
@@ -281,6 +362,13 @@ def match_app(user_input, app_dict):
     for k in keys:
         if k.startswith(name):
             return k
+
+    # contains all query tokens (helps "chrome" -> "google chrome")
+    name_tokens = [t for t in name.split() if t]
+    if name_tokens:
+        for k in keys:
+            if all(tok in k for tok in name_tokens):
+                return k
 
     # fuzzy (reasonable cutoff)
     match = get_close_matches(name, keys, n=1, cutoff=0.65)
@@ -478,7 +566,9 @@ def open_taskbar_app(app_name):
       3) Template matching on full screen (multi-scale)
     Returns True if opened, False otherwise.
     """
-    name = app_name.lower().strip()
+    name = normalize_app_query(app_name)
+    if not name:
+        return False
 
     # --------- Layer 1: Direct launch (fast & reliable if installed) ----------
     try:
@@ -534,80 +624,135 @@ def open_taskbar_app(app_name):
     reply(f"I could not find {name} on your taskbar or system.")
     return False
 
+def _app_alias_terms(query):
+    terms = [query]
+    for canonical, aliases in APP_ALIAS_GROUPS.items():
+        if query == canonical or query in aliases:
+            terms.extend(aliases)
+            terms.append(canonical)
+            break
+    unique_terms = []
+    for t in terms:
+        t = t.strip().lower()
+        if t and t not in unique_terms:
+            unique_terms.append(t)
+    return unique_terms
+
+def _bring_app_window_to_front(query_terms):
+    """Best-effort focus/maximize of newly opened app window."""
+    try:
+        titles = gw.getAllTitles()
+        for title in titles:
+            t = (title or "").lower()
+            if any(term in t for term in query_terms if len(term) > 2):
+                wins = gw.getWindowsWithTitle(title)
+                if wins:
+                    w = wins[0]
+                    if w.isMinimized:
+                        w.restore()
+                    w.activate()
+                    try:
+                        w.maximize()
+                    except Exception:
+                        pass
+                    return True
+    except Exception:
+        pass
+    return False
+
+def _launch_target(target):
+    if not target:
+        return False
+
+    if target.lower().endswith(".lnk"):
+        os.startfile(target)
+        return True
+
+    if target.lower().endswith(".exe") and os.path.exists(target):
+        os.startfile(target)
+        return True
+
+    if os.path.isdir(target):
+        for f in os.listdir(target):
+            if f.lower().endswith(".exe"):
+                os.startfile(os.path.join(target, f))
+                return True
+    return False
+
 def open_system_app(app_name):
     """
     Universal app launcher:
-    - auto-discovers installed apps and UWP exes
-    - launches .lnk or .exe or finds exe in folder
+    - handles plain 'open <app>' and 'open app <app>' forms
+    - resolves aliases (Chrome/Word/PowerPoint, etc.)
+    - starts app and attempts to bring the app window to front
     """
-    if not app_name:
+    query = normalize_app_query(app_name)
+    if not query:
         return "No application name provided."
 
     try:
+        query_terms = _app_alias_terms(query)
+
+        # 1) Direct executable hints for common apps
+        for canonical, executables in APP_DIRECT_EXECUTABLES.items():
+            if canonical in query_terms:
+                for exe in executables:
+                    try:
+                        os.startfile(exe)
+                        time.sleep(1.0)
+                        _bring_app_window_to_front(query_terms + [canonical])
+                        return f"Opening {canonical}"
+                    except Exception:
+                        continue
+
+        # 2) Installed app lookup (Start Menu/registry/UWP/system tools)
         apps = get_all_installed_apps()
-        match = match_app(app_name, apps)
+
+        match = None
+        for term in query_terms:
+            match = match_app(term, apps)
+            if match:
+                break
+
         if not match:
-            # try some common aliases: 'code' -> 'visual studio code', 'vscode' etc
-            # quick alias table (extend if you want)
-            aliases = {
-                "vscode": "visual studio code",
-                "visual studio": "visual studio",
-                "vs code": "visual studio code",
-                "whatsapp": "whatsapp",
-                "one note": "onenote",
-                "onenote": "onenote",
-                "snipping tool": "snippingtool",
-                "snip": "snippingtool",
-                "file explorer": "explorer",
-                "explorer": "explorer"
-            }
-            for a, b in aliases.items():
-                if a in app_name and b in apps:
-                    match = b
+            for key in apps.keys():
+                k = key.lower()
+                if any(term in k for term in query_terms):
+                    match = key
                     break
 
         if not match:
-            return f"I could not find an application named '{app_name}'."
+            return f"I could not find an application named '{query}'."
 
         target = apps.get(match)
-
-        # If it's a .lnk shortcut, launch it
-        if target and target.lower().endswith(".lnk"):
-            os.startfile(target)
+        if _launch_target(target):
+            time.sleep(1.0)
+            _bring_app_window_to_front(query_terms + [match.lower()])
             return f"Opening {match}"
 
-        # If it's an exe path, launch it
-        if target and target.lower().endswith(".exe") and os.path.exists(target):
-            os.startfile(target)
-            return f"Opening {match}"
-
-        # If target is a folder (install location), search for exe inside
-        if target and os.path.isdir(target):
+        # 3) Generic fallback starts
+        for term in [match] + query_terms:
             try:
-                for f in os.listdir(target):
-                    if f.lower().endswith(".exe"):
-                        exe_path = os.path.join(target, f)
-                        os.startfile(exe_path)
-                        return f"Opening {match}"
+                os.startfile(term)
+                time.sleep(1.0)
+                _bring_app_window_to_front(query_terms + [match.lower()])
+                return f"Opening {match}"
             except Exception:
-                pass
+                continue
 
-        # If nothing else, attempt a generic start by name (e.g., builtin exe names or PATH commands)
-        try:
-            os.startfile(match)
-            return f"Opening {match}"
-        except Exception:
-            pass
+        for term in [match] + query_terms:
+            try:
+                subprocess.Popen([term], shell=True)
+                time.sleep(1.0)
+                _bring_app_window_to_front(query_terms + [match.lower()])
+                return f"Opening {match}"
+            except Exception:
+                continue
 
-        # Last-resort: try fuzzy-executing the match string via subprocess
-        try:
-            subprocess.Popen(match)
-            return f"Opening {match}"
-        except Exception as e:
-            return f"I found {match}, but could not start it: {e}"
+        return f"I found {match}, but could not start it."
 
     except Exception as e:
-        return f"Error launching {app_name}: {e}"
+        return f"Error launching {query}: {e}"
 
 
 def minimize_browser_windows():
@@ -1753,6 +1898,7 @@ class IntentRecognizer:
         self.pipeline = make_pipeline(self.vectorizer, self.classifier)
         self.intent_labels = []
         self.training_data = self._create_training_data()
+        self.exact_phrase_to_intent = {}
         self._train_model()
     
     def _create_training_data(self):
@@ -1908,8 +2054,10 @@ class IntentRecognizer:
         
         for intent, examples in self.training_data.items():
             for example in examples:
-                texts.append(example)
+                normalized_example = normalize_voice_text(example)
+                texts.append(normalized_example)
                 labels.append(intent)
+                self.exact_phrase_to_intent[normalized_example] = intent
         
         if texts:
             self.pipeline.fit(texts, labels)
@@ -1924,13 +2072,17 @@ class IntentRecognizer:
             
             if not processed_text.strip():
                 return 'unknown'
+
+            # Prefer exact command phrase match when available
+            if processed_text in self.exact_phrase_to_intent:
+                return self.exact_phrase_to_intent[processed_text]
             
             # Predict using the model
             prediction = self.pipeline.predict([processed_text])[0]
             probability = np.max(self.pipeline.predict_proba([processed_text]))
             
             # Only return prediction if confidence is high enough
-            if probability > 0.3:
+            if probability > 0.45:
                 return prediction
             else:
                 return self._fallback_intent(processed_text)
@@ -1945,7 +2097,7 @@ class IntentRecognizer:
             return ""
         
         # Convert to lowercase and remove extra spaces
-        text = text.lower().strip()
+        text = normalize_voice_text(text)
         
         # Remove common filler words
         filler_words = ['the', 'a', 'an', 'please', 'could', 'you', 'would', 'can', 'will', 'should']
@@ -2008,6 +2160,45 @@ class IntentRecognizer:
 
 # Initialize intent recognizer
 intent_recognizer = IntentRecognizer()
+
+COMMAND_LIBRARY = [
+    normalize_voice_text(example)
+    for examples in intent_recognizer.training_data.values()
+    for example in examples
+]
+
+def _score_command_candidate(candidate):
+    """
+    Score transcript candidates so command-like phrases rank higher.
+    Combines STT confidence and fuzzy similarity against known commands.
+    """
+    transcript = normalize_voice_text(candidate.get("transcript", ""))
+    if not transcript:
+        return -1.0, ""
+
+    stt_confidence = float(candidate.get("confidence", 0.0))
+    similarity = 0.0
+    if COMMAND_LIBRARY:
+        similarity = max(SequenceMatcher(None, transcript, known).ratio() for known in COMMAND_LIBRARY)
+
+    score = (0.65 * similarity) + (0.35 * stt_confidence)
+    return score, transcript
+
+def _best_transcript_from_google(audio):
+    """
+    Request multiple STT alternatives and choose the candidate that best matches
+    known assistant command phrases.
+    """
+    alt_data = r.recognize_google(audio, show_all=True)
+    if isinstance(alt_data, dict):
+        alternatives = alt_data.get("alternative", [])
+        if alternatives:
+            ranked = [_score_command_candidate(candidate) for candidate in alternatives]
+            ranked = [item for item in ranked if item[1]]
+            if ranked:
+                ranked.sort(key=lambda item: item[0], reverse=True)
+                return ranked[0][1]
+    return normalize_voice_text(r.recognize_google(audio))
 
 
 
@@ -2076,8 +2267,8 @@ def extract_entity(text, intent):
         return 'back'
     
     elif intent == 'open_app':
-        # remove open keywords
-        name = re.sub(r'\b(open|launch|start|run|app|application|program)\b', '', text_lower).strip()
+        # remove open keywords and command fillers
+        name = normalize_app_query(text_lower)
         return name if name else None
 
 
@@ -2210,14 +2401,14 @@ def navigate_back():
 def record_audio():
     try:
         with sr.Microphone() as source:
-            r.adjust_for_ambient_noise(source, duration=0.5)
-            r.pause_threshold = 1.0
-            r.energy_threshold = 300
+            r.adjust_for_ambient_noise(source, duration=0.8)
+            r.energy_threshold = max(220, int(r.energy_threshold))
             print("Listening...")
-            audio = r.listen(source, timeout=5, phrase_time_limit=5)
+            audio = r.listen(source, timeout=6, phrase_time_limit=6)
             
         try:
-            voice_data = r.recognize_google(audio).lower()
+            voice_data = _best_transcript_from_google(audio)
+            voice_data = normalize_voice_text(voice_data)
             print(f"Recognized: {voice_data}")
             return voice_data
         except sr.UnknownValueError:
@@ -2831,10 +3022,9 @@ def handle_open_app(app_name):
     if not app_name:
         reply("Which application should I open?")
         return
-    if open_taskbar_app(app_name):
+    target_name = normalize_app_query(app_name)
+    if open_taskbar_app(target_name):
         return
-    result = open_system_app(app_name)
-    reply(result)
 
 def handle_select_range(full_cmd: str):
     # Use shared range-selection engine (with disambiguation)
@@ -2988,16 +3178,29 @@ def respond(voice_data):
     if not voice_data:
         return
        
-    print(f"Processing: {voice_data}")
+    normalized_input = normalize_voice_text(voice_data)
+    print(f"Processing: {normalized_input}")
     
     # Store original for display
     original_voice_data = voice_data
     
     # Remove wake word and clean up for processing
-    processed_voice = voice_data.replace('omega', '').strip()
+    processed_voice = strip_wake_word(normalized_input)
     app.ChatBot.addUserMsg(original_voice_data)
+    if not processed_voice:
+        return
 
-    pv = processed_voice.lower()
+    pv = processed_voice
+
+    # Deterministic app-open handling for:
+    # - "open chrome"
+    # - "open app chrome"
+    # - "launch powerpoint"
+    if is_open_app_command(pv):
+        app_candidate = normalize_app_query(pv)
+        if app_candidate:
+            handle_open_app(app_candidate)
+            return
 
         # Force Tab Control
     if "switch" in pv and "tab" in pv:
@@ -3163,7 +3366,10 @@ if __name__ == "__main__":
             # Process voice_data if we have input
             if voice_data:
                 # Check if omega is mentioned OR if we have GUI input
-                if 'omega' in voice_data.lower() or app.ChatBot.isUserInput():
+                normalized_voice = normalize_voice_text(voice_data)
+                wake_detected = any(w in normalized_voice for w in WAKE_WORD_VARIANTS)
+
+                if wake_detected or app.ChatBot.isUserInput():
                     result = respond(voice_data)
                     if result == "exit":
                         break

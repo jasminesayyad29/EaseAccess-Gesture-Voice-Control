@@ -152,19 +152,19 @@ class HandRecog:
             time.sleep(0.7)
 
         # 3️⃣ Zoom In (Pinch gesture where thumb and index move apart)
-        pinch_distance = math.sqrt(
-            (thumb_tip.x - index_tip.x)**2 +
-            (thumb_tip.y - index_tip.y)**2
-        )
+        # pinch_distance = math.sqrt(
+        #     (thumb_tip.x - index_tip.x)**2 +
+        #     (thumb_tip.y - index_tip.y)**2
+        # )
 
-        # track pinch motion — start when close, then zoom when moving apart
-        if pinch_distance < 0.03:
-            self.pinch_start = pinch_distance
-        elif hasattr(self, 'pinch_start') and pinch_distance - self.pinch_start > 0.04:
-            pyautogui.hotkey('ctrl', '+')
-            print("Zoom In")
-            del self.pinch_start
-            time.sleep(0.5)
+        # # track pinch motion — start when close, then zoom when moving apart
+        # if pinch_distance < 0.03:
+        #     self.pinch_start = pinch_distance
+        # elif hasattr(self, 'pinch_start') and pinch_distance - self.pinch_start > 0.04:
+        #     pyautogui.hotkey('ctrl', '+')
+        #     print("Zoom In")
+        #     del self.pinch_start
+        #     time.sleep(0.5)
 
         return self.ori_gesture
 
@@ -247,16 +247,16 @@ class Controller:
         print("Previous Slide Triggered")
 
     @staticmethod
-    def zoom_in():
-        """Zoom in on the current presentation"""
-        pyautogui.hotkey('ctrl', '+')
-        print("Zoom In Triggered")
+    # def zoom_in():
+    #     """Zoom in on the current presentation"""
+    #     pyautogui.hotkey('ctrl', '+')
+    #     print("Zoom In Triggered")
 
-    @staticmethod
-    def zoom_out():
-        """Zoom out on the current presentation"""
-        pyautogui.hotkey('ctrl', '-')
-        print("Zoom Out Triggered")
+    # @staticmethod
+    # def zoom_out():
+    #     """Zoom out on the current presentation"""
+    #     pyautogui.hotkey('ctrl', '-')
+    #     print("Zoom Out Triggered")
 
 
     @staticmethod
@@ -457,6 +457,7 @@ class GestureController:
                 print("MediaPipe Hands model loaded")
                 
                 frame_count = 0
+                
                 while self.gc_mode and self.cap.isOpened():
                     success, image = self.cap.read()
                     frame_count += 1
@@ -496,7 +497,22 @@ class GestureController:
                             results = hands.process(image_rgb)
                             image_rgb.flags.writeable = True
                             image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+                            # After this line:
 
+                            # ADD THIS to print basic results:
+                            if results.multi_hand_landmarks:
+                                print(f"=== Frame {frame_count} MediaPipe Results ===")
+                                print(f"Hands detected: {len(results.multi_hand_landmarks)}")
+                                
+                                for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                                    print(f"Hand {i+1}: {len(hand_landmarks.landmark)} landmarks")
+                                    
+                                    # Print first few landmark coordinates
+                                    print(f"  Wrist (0): x={hand_landmarks.landmark[0].x:.3f}, y={hand_landmarks.landmark[0].y:.3f}")
+                                    print(f"  Index Tip (8): x={hand_landmarks.landmark[8].x:.3f}, y={hand_landmarks.landmark[8].y:.3f}")
+                                    print(f"  Thumb Tip (4): x={hand_landmarks.landmark[4].x:.3f}, y={hand_landmarks.landmark[4].y:.3f}")
+                            else:
+                                print(f"Frame {frame_count}: No hands detected")
                             if results.multi_hand_landmarks:
                                 print(f"Frame {frame_count}: Hands detected")
                                 self.classify_hands(results)
@@ -544,7 +560,7 @@ class GestureController:
                     # if frame_count >= 100:  # Remove this in production
                     #     print("Frame limit reached for testing")
                     #     break
-                        
+                    
         except Exception as e:
             print(f"Main loop error: {e}")
             traceback.print_exc()

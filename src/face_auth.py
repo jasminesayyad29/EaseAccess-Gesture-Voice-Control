@@ -4,6 +4,7 @@ import numpy as np
 import time
 import os
 import glob
+from collections import deque
 
 # ---------- User settings ----------
 AUTHORIZED_IMAGES_FOLDER = "known_faces"  # folder of authorized face images
@@ -16,12 +17,16 @@ MATCH_RATIO_THRESHOLD = 0.12
 GOOD_MATCHS_MIN = 8
 
 # Temporal / smoothing
-CHECK_INTERVAL = 6.0       # seconds between expensive re-checks
-MIN_FACE_TIME = 1.5        # must see a face this long before first check
-AUTO_UNAUTH_SECONDS = 10.0 # auto-unauthorize after this many seconds of no face
+CHECK_INTERVAL_UNAUTHORIZED = 1.0  # faster checks while trying to authorize
+CHECK_INTERVAL_AUTHORIZED = 2.0    # slower checks once authorized
+MIN_FACE_TIME = 1.0                # must see a face this long before first check
+AUTO_UNAUTH_SECONDS = 8.0          # auto-unauthorize after this many seconds of no face
 
 # Rolling score buffer
 RECENT_SCORES_LEN = 5
+RECENT_DECISIONS_LEN = 7
+PASS_RATIO_THRESHOLD = 0.60
+FAIL_RATIO_THRESHOLD = 0.70
 
 # Streaks: require consecutive successes/fails to change state
 SUCCESS_STREAK_REQUIRED = 2
@@ -57,6 +62,7 @@ class FaceAuthenticator:
         self.success_streak = 0
         self.fail_streak = 0
         self.recent_scores = []
+        self.recent_decisions = deque(maxlen=RECENT_DECISIONS_LEN)
 
         # Authorized faces storage
         # auth_faces_images -> list of preprocessed grayscale faces (for display/comparison)
@@ -66,6 +72,38 @@ class FaceAuthenticator:
 
         # Load authorized faces from folder
         self._load_authorized_faces()
+
+    def _enhance_gray(self, gray):
+        """Normalize illumination/noise before detection and ORB extraction."""
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        gray = self.clahe.apply(gray)
+        return gray
+
+    def _detect_faces(self, gray):
+        """
+        Detect faces with a small fallback sweep for robustness across light/angle.
+        Returns list of rectangles (x, y, w, h).
+        """
+        enhanced = self._enhance_gray(gray)
+
+        faces = self.face_cascade.detectMultiScale(
+            enhanced, scaleFactor=1.06, minNeighbors=5, minSize=(60, 60)
+        )
+        if len(faces) > 0:
+            return faces
+
+        # Fallback: slightly more permissive params
+        faces = self.face_cascade.detectMultiScale(
+            enhanced, scaleFactor=1.10, minNeighbors=4, minSize=(50, 50)
+        )
+        if len(faces) > 0:
+            return faces
+
+        # Last fallback on original grayscale (helps rare over-equalized frames)
+        faces = self.face_cascade.detectMultiScale(
+            gray, scaleFactor=1.08, minNeighbors=4, minSize=(50, 50)
+        )
+        return faces
 
     def _load_authorized_faces(self):
         """Load face images from the authorized folder and compute ORB descriptors."""
@@ -115,17 +153,16 @@ class FaceAuthenticator:
             raise FileNotFoundError(f"Image not found at: {path}")
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(50, 50))
+        faces = self._detect_faces(gray)
         if len(faces) == 0:
             return None
 
         x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
         face = gray[y:y + h, x:x + w]
 
-        # Preprocessing: resize -> blur -> clahe (local histogram equalization)
+        # Preprocessing: resize -> normalize illumination/noise
         face = cv2.resize(face, (200, 200))
-        face = cv2.GaussianBlur(face, (3, 3), 0)
-        face = self.clahe.apply(face)
+        face = self._enhance_gray(face)
 
         return face
 
@@ -209,9 +246,7 @@ class FaceAuthenticator:
 
         # Convert and detect faces
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(
-            gray, scaleFactor=1.08, minNeighbors=4, minSize=(60, 60)
-        )
+        faces = self._detect_faces(gray)
         face_detected = len(faces) > 0
 
         # Update face detection timing
@@ -230,10 +265,12 @@ class FaceAuthenticator:
             current_time - self.face_detected_start_time if self.continuous_face_detected else 0.0
         )
 
+        check_interval = CHECK_INTERVAL_AUTHORIZED if self.authorized else CHECK_INTERVAL_UNAUTHORIZED
+
         if (
             face_detected
             and self.auth_descriptors
-            and time_since_last_check >= CHECK_INTERVAL
+            and time_since_last_check >= check_interval
             and face_detected_duration >= MIN_FACE_TIME
         ):
             # Crop the largest face
@@ -242,8 +279,7 @@ class FaceAuthenticator:
 
             # Preprocess ROI similar to authorized samples
             face_roi = cv2.resize(face_roi, (200, 200))
-            face_roi = cv2.GaussianBlur(face_roi, (3, 3), 0)
-            face_roi = self.clahe.apply(face_roi)
+            face_roi = self._enhance_gray(face_roi)
 
             # Compute descriptors
             _, des_live = self.compute_orb_descriptors(face_roi)
@@ -260,31 +296,36 @@ class FaceAuthenticator:
                 # Use average score to smooth decisions (and keep streak logic)
                 # Derive boolean decision from avg_score and match conditions
                 final_is_match = (avg_score > 15.0) and (n_good >= GOOD_MATCHS_MIN and ratio >= MATCH_RATIO_THRESHOLD)
+                self.recent_decisions.append(1 if final_is_match else 0)
+                pass_ratio = float(sum(self.recent_decisions) / len(self.recent_decisions))
+                stable_pass = pass_ratio >= PASS_RATIO_THRESHOLD
+                stable_fail = pass_ratio <= (1.0 - FAIL_RATIO_THRESHOLD)
 
                 # Update streaks
                 if final_is_match:
                     self.success_streak += 1
                     self.fail_streak = 0
-                    if self.success_streak >= SUCCESS_STREAK_REQUIRED:
+                    if self.success_streak >= SUCCESS_STREAK_REQUIRED and stable_pass:
                         if not self.authorized:
                             self.authorized = True
                             print("[FACE AUTH] Authorized - Gesture control ENABLED")
                 else:
                     self.fail_streak += 1
                     self.success_streak = 0
-                    if self.fail_streak >= FAIL_STREAK_REQUIRED:
+                    if self.fail_streak >= FAIL_STREAK_REQUIRED and stable_fail:
                         if self.authorized:
                             self.authorized = False
                             print("[FACE AUTH] Unauthorized - Gesture control DISABLED")
 
                 # Update textual/debug info and timers
-                self.last_match_result = f"{match_text} | avg_score={avg_score:.2f}"
+                self.last_match_result = f"{match_text} | avg_score={avg_score:.2f}, pass_ratio={pass_ratio:.2f}"
                 self.last_match_time = current_time
                 self.last_check_time = current_time
             else:
                 # No descriptors for live face (rare). Count as fail.
                 self.fail_streak += 1
                 self.success_streak = 0
+                self.recent_decisions.append(0)
                 if self.fail_streak >= FAIL_STREAK_REQUIRED and self.authorized:
                     self.authorized = False
                     print("[FACE AUTH] Unauthorized (no descriptors) - Gesture control DISABLED")
@@ -295,6 +336,9 @@ class FaceAuthenticator:
         # Auto-unauthorize if no face detected for a while
         if self.authorized and (not face_detected) and (current_time - self.last_face_detection_time > AUTO_UNAUTH_SECONDS):
             self.authorized = False
+            self.success_streak = 0
+            self.fail_streak = 0
+            self.recent_decisions.clear()
             print("[FACE AUTH] No face detected for {:.1f}s - UNAUTHORIZED".format(AUTO_UNAUTH_SECONDS))
 
         return face_detected, faces
@@ -372,7 +416,7 @@ def run_face_auth_standalone():
                 break
 
     finally:
-        cap.relOmega()
+        cap.release()
         cv2.destroyAllWindows()
         print("Face Authentication stopped.")
 
