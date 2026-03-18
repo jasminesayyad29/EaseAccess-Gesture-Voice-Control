@@ -24,6 +24,11 @@ mp_hands = mp.solutions.hands
 VERBOSE_FRAME_LOGS = False
 AUTHORIZATION_HOLD_SECONDS = 3.5
 
+# Preview UI controls
+PREVIEW_WINDOW_NAME = 'EaseAccess Preview (Press Q to quit)'
+PIP_WIDTH = 420
+PIP_MARGIN = 24
+
 print("=== GESTURE CONTROLLER DEBUG START ===")
 
 # Gesture Encodings 
@@ -383,6 +388,68 @@ class GestureController:
     auth_gate_authorized = False
     last_authorized_time = 0.0
 
+    @staticmethod
+    def _configure_preview_window(frame_width, frame_height):
+        cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(PREVIEW_WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
+        pip_width = int(PIP_WIDTH)
+        pip_height = int((frame_height / max(1, frame_width)) * pip_width)
+        cv2.resizeWindow(PREVIEW_WINDOW_NAME, pip_width, pip_height)
+
+        screen_w, screen_h = pyautogui.size()
+        pos_x = max(0, int(screen_w - pip_width - PIP_MARGIN))
+        pos_y = int(PIP_MARGIN)
+        cv2.moveWindow(PREVIEW_WINDOW_NAME, pos_x, pos_y)
+
+    @staticmethod
+    def _draw_preview_ui(image, is_authorized, raw_is_authorized, face_auth):
+        h, w = image.shape[:2]
+        status_text = "AUTHORIZED" if is_authorized else "UNAUTHORIZED"
+        if is_authorized and not raw_is_authorized:
+            status_text = "AUTHORIZED (HOLD)"
+        status_color = (42, 165, 95) if is_authorized else (52, 64, 212)
+
+        overlay = image.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 52), (16, 20, 25), -1)
+        cv2.rectangle(overlay, (0, h - 34), (w, h), (16, 20, 25), -1)
+        image = cv2.addWeighted(overlay, 0.52, image, 0.48, 0)
+
+        cv2.circle(image, (22, 26), 8, status_color, -1)
+        cv2.putText(
+            image,
+            f"Status: {status_text}",
+            (38, 31),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (245, 245, 245),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            "EaseAccess | Press Q to quit",
+            (12, h - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
+        if time.time() - face_auth.get_last_match_time() < 10:
+            cv2.putText(
+                image,
+                face_auth.get_last_match_result(),
+                (12, min(50, h - 44)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (230, 230, 230),
+                1,
+                cv2.LINE_AA,
+            )
+
+        return image
+
     def __init__(self):
         print("Initializing GestureController...")
         
@@ -454,6 +521,8 @@ class GestureController:
         if self.cap is None or not self.cap.isOpened():
             print("ERROR: Camera not available. Cannot start.")
             return
+
+        self._configure_preview_window(int(self.CAM_WIDTH or 640), int(self.CAM_HEIGHT or 480))
         
         print("Gesture Controller Starting...")
         print("Press 'q' to quit, 'Enter' was causing issues")
@@ -501,27 +570,19 @@ class GestureController:
                             color = (0, 255, 0) if raw_is_authorized else (0, 0, 255)
                             cv2.rectangle(image, (x,y), (x+w, y+h), color, 2)
                         
-                        # Display authorization status
-                        auth_status = "AUTHORIZED" if is_authorized else "UNAUTHORIZED"
-                        if is_authorized and not raw_is_authorized:
-                            auth_status = "AUTHORIZED (HOLD)"
-                        status_color = (0, 255, 0) if is_authorized else (0, 0, 255)
-                        cv2.putText(image, f"Status: {auth_status}", (10, 30), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-
-                        if time.time() - self.face_auth.get_last_match_time() < 10:
-                            cv2.putText(image, self.face_auth.get_last_match_result(), (10, 60),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        
                     except Exception as e:
                         print(f"Face auth error: {e}")
                         # Do not instantly cut off gestures due to a transient auth exception.
                         is_authorized = (time.time() - self.last_authorized_time) <= AUTHORIZATION_HOLD_SECONDS
+                        raw_is_authorized = is_authorized
                     
                     # Only process gestures if authorized
                     if is_authorized:
                         try:
-                            image_rgb = cv2.cvtColor(cv2.flip(image, 1), cv2.COLOR_BGR2RGB)
+                            # Keep gesture behavior unchanged by processing a mirrored frame,
+                            # then flip back only for display to avoid mirrored preview.
+                            mirrored_for_processing = cv2.flip(image, 1)
+                            image_rgb = cv2.cvtColor(mirrored_for_processing, cv2.COLOR_BGR2RGB)
                             image_rgb.flags.writeable = False
                             results = hands.process(image_rgb)
                             image_rgb.flags.writeable = True
@@ -578,8 +639,13 @@ class GestureController:
                     else:
                         cv2.putText(image, "UNAUTHORIZED - Gestures disabled", 
                                    (50, image.shape[0]//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+                    if is_authorized:
+                        image = cv2.flip(image, 1)
+
+                    image = self._draw_preview_ui(image, is_authorized, raw_is_authorized, self.face_auth)
                     
-                    cv2.imshow('Gesture Controller - Press Q to quit', image)
+                    cv2.imshow(PREVIEW_WINDOW_NAME, image)
                     
                     # Use 'q' instead of Enter for quitting
                     if cv2.waitKey(1) & 0xFF == ord('q'):
