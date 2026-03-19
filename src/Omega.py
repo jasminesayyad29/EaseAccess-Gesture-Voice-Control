@@ -29,6 +29,7 @@ warnings.filterwarnings('ignore')
 import glob
 import subprocess
 import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\tesseract\tesseract-ocr-w64-setup-5.5.0.20241111.exe"
 from PIL import ImageGrab, Image
 import pyautogui
 import cv2
