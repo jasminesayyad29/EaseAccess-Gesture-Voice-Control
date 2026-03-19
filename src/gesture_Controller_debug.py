@@ -2,6 +2,8 @@ import cv2
 import mediapipe as mp
 import pyautogui
 import math
+import argparse
+import sys
 from enum import IntEnum
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
@@ -23,6 +25,7 @@ mp_hands = mp.solutions.hands
 # Debug/runtime controls
 VERBOSE_FRAME_LOGS = False
 AUTHORIZATION_HOLD_SECONDS = 3.5
+FACE_AUTH_FAILURE_EXIT_CODE = 86
 
 # Preview UI controls
 PREVIEW_WINDOW_NAME = 'EaseAccess Preview (Press Q to quit)'
@@ -387,6 +390,8 @@ class GestureController:
     face_auth = None
     auth_gate_authorized = False
     last_authorized_time = 0.0
+    auth_error_count = 0
+    max_auth_errors = 20
 
     @staticmethod
     def _configure_preview_window(frame_width, frame_height):
@@ -436,7 +441,7 @@ class GestureController:
             cv2.LINE_AA,
         )
 
-        if time.time() - face_auth.get_last_match_time() < 10:
+        if face_auth is not None and (time.time() - face_auth.get_last_match_time() < 10):
             cv2.putText(
                 image,
                 face_auth.get_last_match_result(),
@@ -450,8 +455,9 @@ class GestureController:
 
         return image
 
-    def __init__(self):
+    def __init__(self, disable_face_auth=False):
         print("Initializing GestureController...")
+        self.disable_face_auth = bool(disable_face_auth)
         
         # Initialize camera with error handling
         try:
@@ -478,12 +484,16 @@ class GestureController:
             return
         
         # Initialize face authentication
-        try:
-            self.face_auth = FaceAuthenticator()
-            print("Face authentication initialized")
-        except Exception as e:
-            print(f"Face auth initialization error: {e}")
-            return
+        if self.disable_face_auth:
+            self.face_auth = None
+            print("Face authentication disabled (-fd mode)")
+        else:
+            try:
+                self.face_auth = FaceAuthenticator()
+                print("Face authentication initialized")
+            except Exception as e:
+                print(f"Face auth initialization error: {e}")
+                raise RuntimeError("face auth initialization failed") from e
         
         self.gc_mode = 1
         self.auth_gate_authorized = False
@@ -548,33 +558,41 @@ class GestureController:
                         print(f"Frame {frame_count}: Processing...")
                     
                     # Face authentication
-                    try:
-                        face_detected, faces = self.face_auth.authenticate_frame(image)
-                        raw_is_authorized = self.face_auth.get_auth_status()
-                        now = time.time()
+                    if self.disable_face_auth:
+                        is_authorized = True
+                        raw_is_authorized = True
+                    else:
+                        try:
+                            face_detected, faces = self.face_auth.authenticate_frame(image)
+                            raw_is_authorized = self.face_auth.get_auth_status()
+                            now = time.time()
 
-                        # Keep gestures enabled for a short grace window to prevent frame-level auth flicker.
-                        if raw_is_authorized:
-                            self.last_authorized_time = now
-                            self.auth_gate_authorized = True
-                        elif now - self.last_authorized_time <= AUTHORIZATION_HOLD_SECONDS:
-                            self.auth_gate_authorized = True
-                        else:
-                            self.auth_gate_authorized = False
+                            # Keep gestures enabled for a short grace window to prevent frame-level auth flicker.
+                            if raw_is_authorized:
+                                self.last_authorized_time = now
+                                self.auth_gate_authorized = True
+                            elif now - self.last_authorized_time <= AUTHORIZATION_HOLD_SECONDS:
+                                self.auth_gate_authorized = True
+                            else:
+                                self.auth_gate_authorized = False
 
-                        is_authorized = self.auth_gate_authorized
-                        
-                        # Draw face bounding box and status
-                        if face_detected:
-                            x,y,w,h = max(faces, key=lambda r: r[2]*r[3])
-                            color = (0, 255, 0) if raw_is_authorized else (0, 0, 255)
-                            cv2.rectangle(image, (x,y), (x+w, y+h), color, 2)
-                        
-                    except Exception as e:
-                        print(f"Face auth error: {e}")
-                        # Do not instantly cut off gestures due to a transient auth exception.
-                        is_authorized = (time.time() - self.last_authorized_time) <= AUTHORIZATION_HOLD_SECONDS
-                        raw_is_authorized = is_authorized
+                            is_authorized = self.auth_gate_authorized
+                            self.auth_error_count = 0
+                            
+                            # Draw face bounding box and status
+                            if face_detected:
+                                x,y,w,h = max(faces, key=lambda r: r[2]*r[3])
+                                color = (0, 255, 0) if raw_is_authorized else (0, 0, 255)
+                                cv2.rectangle(image, (x,y), (x+w, y+h), color, 2)
+                            
+                        except Exception as e:
+                            self.auth_error_count += 1
+                            print(f"Face auth error ({self.auth_error_count}/{self.max_auth_errors}): {e}")
+                            if self.auth_error_count >= self.max_auth_errors:
+                                raise RuntimeError("face auth runtime failed repeatedly") from e
+                            # Do not instantly cut off gestures due to a transient auth exception.
+                            is_authorized = (time.time() - self.last_authorized_time) <= AUTHORIZATION_HOLD_SECONDS
+                            raw_is_authorized = is_authorized
                     
                     # Only process gestures if authorized
                     if is_authorized:
@@ -643,7 +661,10 @@ class GestureController:
                     if is_authorized:
                         image = cv2.flip(image, 1)
 
-                    image = self._draw_preview_ui(image, is_authorized, raw_is_authorized, self.face_auth)
+                    if self.disable_face_auth:
+                        image = self._draw_preview_ui(image, True, True, None)
+                    else:
+                        image = self._draw_preview_ui(image, is_authorized, raw_is_authorized, self.face_auth)
                     
                     cv2.imshow(PREVIEW_WINDOW_NAME, image)
                     
@@ -660,6 +681,8 @@ class GestureController:
         except Exception as e:
             print(f"Main loop error: {e}")
             traceback.print_exc()
+            if "face auth" in str(e).lower():
+                raise
         
         finally:
             if self.cap:
@@ -669,13 +692,27 @@ class GestureController:
 
 if __name__ == "__main__":
     print("=== MAIN EXECUTION START ===")
+    parser = argparse.ArgumentParser(description="Gesture controller")
+    parser.add_argument("-fd", "--face-disabled", action="store_true", help="Disable face auth gate")
+    args = parser.parse_args()
+
     try:
-        gc = GestureController()
+        gc = GestureController(disable_face_auth=args.face_disabled)
         if gc.cap and gc.cap.isOpened():
             gc.start()
         else:
             print("Failed to initialize GestureController")
+            sys.exit(1)
+    except RuntimeError as e:
+        err = str(e).lower()
+        if "face auth" in err:
+            print(f"Exiting with face-auth failure code: {FACE_AUTH_FAILURE_EXIT_CODE}")
+            sys.exit(FACE_AUTH_FAILURE_EXIT_CODE)
+        print(f"Runtime error: {e}")
+        traceback.print_exc()
+        sys.exit(1)
     except Exception as e:
         print(f"Main execution error: {e}")
         traceback.print_exc()
+        sys.exit(1)
     print("=== PROGRAM END ===")
