@@ -6,12 +6,29 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 
 FACE_AUTH_FAILURE_EXIT_CODE = 86
 
 
-def _start_controller(script_path: Path, label: str, extra_args=None) -> subprocess.Popen:
+def _resolve_script_path(base_dir: Path, script_name: str) -> Path:
+    candidates = [
+        base_dir / "_main_" / script_name,
+        base_dir / script_name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Missing script '{script_name}'. Checked: {', '.join(str(p) for p in candidates)}")
+
+
+def _start_controller(
+    script_path: Path,
+    label: str,
+    extra_args=None,
+    run_cwd: Optional[Path] = None,
+) -> subprocess.Popen:
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
 
@@ -24,7 +41,7 @@ def _start_controller(script_path: Path, label: str, extra_args=None) -> subproc
 
     process = subprocess.Popen(
         [sys.executable, str(script_path), *extra_args],
-        cwd=str(script_path.parent),
+        cwd=str(run_cwd or script_path.parent),
         env=env,
         creationflags=creationflags,
     )
@@ -61,14 +78,23 @@ def _register_user_if_needed(base_dir: Path, username: str) -> bool:
         print(f"[MAIN] Face data already exists for '{username}'. Skipping registration.")
         return True
 
-    register_script = base_dir / "face_auth_register.py"
-    if not register_script.exists():
-        print(f"[MAIN] Missing registration script: {register_script}")
+    try:
+        register_script = _resolve_script_path(base_dir, "face_auth_register.py")
+    except FileNotFoundError as exc:
+        print(f"[MAIN] {exc}")
         return False
 
     print(f"[MAIN] No face data found for '{username}'. Starting registration...")
     result = subprocess.run(
-        [sys.executable, str(register_script), username, "--count", "15"],
+        [
+            sys.executable,
+            str(register_script),
+            username,
+            "--count",
+            "15",
+            "--folder",
+            str(known_faces_dir),
+        ],
         cwd=str(base_dir),
     )
 
@@ -116,13 +142,8 @@ def main():
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
-    gesture_script = base_dir / "gesture_Controller_debug.py"
-    voice_script = base_dir / "voice_Controller_omega.py"
-
-    if not gesture_script.exists():
-        raise FileNotFoundError(f"Missing: {gesture_script}")
-    if not voice_script.exists():
-        raise FileNotFoundError(f"Missing: {voice_script}")
+    gesture_script = _resolve_script_path(base_dir, "gesture_Controller_debug.py")
+    voice_script = _resolve_script_path(base_dir, "voice_Controller_omega.py")
 
     raw_username = args.username
     if not raw_username:
@@ -142,11 +163,11 @@ def main():
     print("[MAIN] Launching gesture and voice controllers...")
     print("[MAIN] Press Ctrl+C in this terminal to stop both.")
 
-    voice_proc = _start_controller(voice_script, "voice controller")
+    voice_proc = _start_controller(voice_script, "voice controller", run_cwd=base_dir)
     # Small stagger helps camera and audio init avoid startup collisions.
     time.sleep(1.2)
     gesture_extra_args = ["-fd"] if args.face_disabled else []
-    gesture_proc = _start_controller(gesture_script, "gesture controller", gesture_extra_args)
+    gesture_proc = _start_controller(gesture_script, "gesture controller", gesture_extra_args, run_cwd=base_dir)
 
     should_restart_without_face_auth = False
 

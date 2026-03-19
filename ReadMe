@@ -3,5 +3,6 @@
 3. Run `pip install -r .\requirements.txt --dry-run --ignore-installed` and check if all the packages are compatible with your system. If not, install the compatible versions of the packages.
 4. Run `pip install -r .\requirements.txt` to install all the required packages.
 5. Install Protobuf additionally with `pip install protobuf==3.20.3`.          
-6. To Run the Project , goto ./src/ and enter `python main.py` , enter username to register FACE , make sure you are in a proper lighting condition.
+6. To Run the Project , goto ./src/ and enter `python main.py` , enter username to register FACE , make sure you are in a proper lighting condition, DONT PRESS ANY KEY WHILE REGISTRATION .
+   - also adding an image manually in known_faces folder would work as Registration.
 7. If Face isnt authenticated properly then quit and Run `python main.py -fd`, to run project without FACE AUTH.

@@ -40,6 +40,23 @@ SOFT_FAIL_ORB_GOOD_MATCH_MARGIN = 2
 # ------------------------------------
 
 
+def _resolve_authorized_images_folder(folder_candidate):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.isabs(folder_candidate):
+        return folder_candidate
+
+    # Prefer sibling of .py folder (src/known_faces) for this repository layout.
+    candidates = [
+        os.path.join(os.path.dirname(script_dir), folder_candidate),
+        os.path.join(script_dir, folder_candidate),
+        os.path.join(os.getcwd(), folder_candidate),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
 class FaceAuthenticatorHighAccuracy:
     """
     High-reliability face authenticator using two-stage verification:
@@ -84,14 +101,8 @@ class FaceAuthenticatorHighAccuracy:
         self.identity_name_by_label = {}
         self.auth_descriptors_by_label = {}
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
         folder_candidate = authorized_images_folder or AUTHORIZED_IMAGES_FOLDER
-        if os.path.isabs(folder_candidate):
-            self.authorized_images_folder = folder_candidate
-        else:
-            self.authorized_images_folder = os.path.join(script_dir, folder_candidate)
-            if not os.path.exists(self.authorized_images_folder):
-                self.authorized_images_folder = os.path.join(os.getcwd(), folder_candidate)
+        self.authorized_images_folder = _resolve_authorized_images_folder(folder_candidate)
 
         self._load_and_train()
 

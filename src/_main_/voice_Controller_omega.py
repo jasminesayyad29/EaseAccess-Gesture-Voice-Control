@@ -29,7 +29,6 @@ warnings.filterwarnings('ignore')
 import glob
 import subprocess
 import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\tesseract\tesseract-ocr-w64-setup-5.5.0.20241111.exe"
 from PIL import ImageGrab, Image
 import pyautogui
 import cv2
@@ -1549,12 +1548,39 @@ def select_text_range_by_phrases(start_phrase: str, end_phrase: str):
         reply("I couldn't select that text range.")
         return False
 
+
+def capture_screen_region(x, y, width, height):
+    """Capture a screen region and return a PIL image."""
+    left = max(int(x), 0)
+    top = max(int(y), 0)
+    right = max(left + int(width), left + 1)
+    bottom = max(top + int(height), top + 1)
+    return ImageGrab.grab(bbox=(left, top, right, bottom))
+
+
+def preprocess_image(img):
+    """Light OCR-oriented preprocessing that preserves text edges."""
+    if img is None:
+        return img
+
+    np_img = np.array(img)
+    if len(np_img.shape) == 3:
+        gray = cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = np_img
+
+    denoised = cv2.bilateralFilter(gray, 7, 60, 60)
+    enhanced = cv2.convertScaleAbs(denoised, alpha=1.2, beta=6)
+    return enhanced
+
 def get_all_ocr_boxes():
     """
     Use the SAME OCR pipeline we already use for find_text_boxes(),
     but return ALL detected word boxes (no text matching).
     """
     try:
+        screen_width, screen_height = pyautogui.size()
+
         # 1) Capture full screen using your accurate capturer
         img = capture_screen_region(0, 0, screen_width, screen_height)
 
