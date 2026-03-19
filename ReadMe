@@ -1,1 +1,5 @@
-Python Version Required is 3.9.13
+1. Python Version Required is 3.9.13
+2. Should Install and add tesseract.exe in system path to use pytesseract library. Download link: https://github.com/UB-Mannheim/tesseract/wiki
+3. Run "pip install -r .\requirements.txt --dry-run --ignore-installed" and check if all the packages are compatible with your system. If not, install the compatible versions of the packages.
+4. Run "pip install -r .\requirements.txt" to install all the required packages.
+5. Install Protobuf with "pip install protobuf==3.20.3".
