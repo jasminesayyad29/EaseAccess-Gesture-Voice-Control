@@ -1,8 +1,32 @@
-1. Python Version Required is 3.9.13.
-2. Install and add tesseract.exe in system path to use pytesseract library. Download link: https://github.com/UB-Mannheim/tesseract/wiki
-3. Run `pip install -r .\requirements.txt --dry-run --ignore-installed` and check if all the packages are compatible with your system. If not, install the compatible versions of the packages.
-4. Run `pip install -r .\requirements.txt` to install all the required packages.
-5. Install Protobuf additionally with `pip install protobuf==3.20.3`.          
-6. To Run the Project , goto ./src/ and enter `python main.py` , enter username to register FACE , make sure you are in a proper lighting condition, DONT PRESS ANY KEY WHILE REGISTRATION .
-   - also adding an image manually in known_faces folder would work as Registration.
-7. If Face isnt authenticated properly then quit and Run `python main.py -fd`, to run project without FACE AUTH.
+Easy Setup Guide
+
+1. Use Python version `3.9.13`.
+
+2. Install Tesseract OCR.
+   Download from: https://github.com/UB-Mannheim/tesseract/wiki
+   After installing, add `tesseract.exe` to your system PATH.
+
+3. Check package compatibility first:
+   `pip install -r .\requirements.txt --dry-run --ignore-installed`
+
+4. Install required packages:
+   `pip install -r .\requirements.txt`
+
+5. Install Protobuf separately:
+   `pip install protobuf==3.20.3`
+
+6. Run the project:
+   - Go to `./src/`
+   - Run: `python main.py`
+   - Enter a username to register face
+   - Sit in good lighting
+   - ALIGN your FACE into WHITE BOX Properly
+   - Do not press any key during face registration , it Registers Automatically
+
+7. Optional face registration method:
+   You can also add a face image manually inside the `known_faces` folder.
+
+8. If face authentication is not working:
+   - Close the app
+   - Run this command to start without face auth:
+     `python main.py -fd`

@@ -12,8 +12,6 @@ import psutil
 from os import listdir
 from os.path import isfile, join, exists
 import wikipedia
-import app
-from threading import Thread
 import re
 import json
 from difflib import SequenceMatcher
@@ -40,6 +38,10 @@ import win32con
 import win32api
 import pythoncom
 import pychrome
+try:
+    from voice_indicator import VoiceStateIndicator
+except Exception:
+    VoiceStateIndicator = None
 
 
 # Keep track of where we came from so we can return if needed
@@ -85,6 +87,44 @@ if engine:
         if voices:
             engine.setProperty('voice', voices[0].id)
     except:
+        pass
+
+voice_indicator = VoiceStateIndicator() if VoiceStateIndicator is not None else None
+
+
+def _voice_show_listening():
+    if voice_indicator is None:
+        return
+    try:
+        voice_indicator.show_listening()
+    except Exception:
+        pass
+
+
+def _voice_show_recognized():
+    if voice_indicator is None:
+        return
+    try:
+        voice_indicator.show_recognized()
+    except Exception:
+        pass
+
+
+def _voice_hide():
+    if voice_indicator is None:
+        return
+    try:
+        voice_indicator.hide()
+    except Exception:
+        pass
+
+
+def _voice_close():
+    if voice_indicator is None:
+        return
+    try:
+        voice_indicator.close()
+    except Exception:
         pass
 
 # ----------------Variables------------------------
@@ -2238,8 +2278,7 @@ def is_double_click_command(text):
 def reply(audio):
     if not audio:
         return
-        
-    app.ChatBot.addAppMsg(audio)
+
     print(f"omega: {audio}")
     
     if engine:
@@ -2418,8 +2457,7 @@ def navigate_back():
             item_type = "file" if isfile(join(current_directory, f)) else "folder"
             filestr += f"{counter}: {f} ({item_type})<br>"
             print(f"{counter}: {f} ({item_type})")
-        
-        app.ChatBot.addAppMsg(filestr)
+
         return f"Navigated back to: {current_directory}"
     except Exception as e:
         return f"Error navigating back: {str(e)}"
@@ -2427,6 +2465,7 @@ def navigate_back():
 # Audio to String with better error handling
 def record_audio():
     try:
+        _voice_show_listening()
         with sr.Microphone() as source:
             r.adjust_for_ambient_noise(source, duration=0.8)
             r.energy_threshold = max(220, int(r.energy_threshold))
@@ -2437,20 +2476,25 @@ def record_audio():
             voice_data = _best_transcript_from_google(audio)
             voice_data = normalize_voice_text(voice_data)
             print(f"Recognized: {voice_data}")
+            _voice_show_recognized()
             return voice_data
         except sr.UnknownValueError:
             print("Could not understand audio")
+            _voice_hide()
             return ""
         except sr.RequestError as e:
             print(f"Speech recognition error: {e}")
             reply('Speech recognition service error. Check internet connection.')
+            _voice_hide()
             return ""
             
     except sr.WaitTimeoutError:
         print("Listening timeout")
+        _voice_hide()
         return ""
     except Exception as e:
         print(f"Microphone error: {e}")
+        _voice_hide()
         return ""
 
 def handle_greeting():
@@ -3209,11 +3253,8 @@ def respond(voice_data):
     print(f"Processing: {normalized_input}")
     
     # Store original for display
-    original_voice_data = voice_data
-    
     # Remove wake word and clean up for processing
     processed_voice = strip_wake_word(normalized_input)
-    app.ChatBot.addUserMsg(original_voice_data)
     if not processed_voice:
         return
 
@@ -3360,43 +3401,22 @@ def respond(voice_data):
 # ------------------Driver Code--------------------
 
 if __name__ == "__main__":
-    # Start the chatbot GUI in a separate thread
-    t1 = Thread(target=app.ChatBot.start, daemon=True)
-    t1.start()
-
-    # Wait for chatbot to start
-    max_wait = 10  # seconds
-    wait_time = 0
-    while not app.ChatBot.started and wait_time < max_wait:
-        time.sleep(0.5)
-        wait_time += 0.5
-        print("Waiting for chatbot to start...")
-
-    if not app.ChatBot.started:
-        print("Chatbot failed to start within expected time")
-    else:
-        print("Chatbot started successfully")
-
     print(get_taskbar_buttons())    
 
     wish()
     
     while True:
         try:
-            if app.ChatBot.isUserInput():
-                # Take input from GUI
-                voice_data = app.ChatBot.popUserInput()
-            else:
-                # Take input from Voice
-                voice_data = record_audio()
+            # Take input from voice only
+            voice_data = record_audio()
 
             # Process voice_data if we have input
             if voice_data:
-                # Check if omega is mentioned OR if we have GUI input
+                # Check if omega is mentioned
                 normalized_voice = normalize_voice_text(voice_data)
                 wake_detected = any(w in normalized_voice for w in WAKE_WORD_VARIANTS)
 
-                if wake_detected or app.ChatBot.isUserInput():
+                if wake_detected:
                     result = respond(voice_data)
                     if result == "exit":
                         break
@@ -3415,4 +3435,5 @@ if __name__ == "__main__":
             print(f"Unexpected error: {e}")
             time.sleep(1)  # Prevent rapid error looping
 
+    _voice_close()
     print("omega shutdown complete")
