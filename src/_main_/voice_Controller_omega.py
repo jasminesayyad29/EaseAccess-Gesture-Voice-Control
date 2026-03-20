@@ -70,10 +70,11 @@ keyboard = Controller()
 # Voice recognition tuning (balanced for noisy rooms)
 r.dynamic_energy_threshold = True
 r.dynamic_energy_adjustment_damping = 0.15
-r.dynamic_energy_ratio = 1.7
-r.pause_threshold = 0.8
-r.phrase_threshold = 0.25
-r.non_speaking_duration = 0.4
+r.dynamic_energy_ratio = 1.55
+r.pause_threshold = 0.45
+r.phrase_threshold = 0.15
+r.non_speaking_duration = 0.2
+r.operation_timeout = 4
 
 engine = None
 
@@ -186,6 +187,9 @@ APP_DIRECT_EXECUTABLES = {
 
 AMBIENT_RECALIBRATE_EVERY_SEC = 90
 ACTIVE_COMMAND_WINDOW_SEC = 14
+AMBIENT_CALIBRATION_DURATION_SEC = 0.18
+LISTEN_TIMEOUT_SEC = 1.2
+LISTEN_PHRASE_TIME_LIMIT_SEC = 2.8
 _audio_calibrated = False
 _last_ambient_calibration_at = 0.0
 _last_wake_detected_at = 0.0
@@ -2551,16 +2555,24 @@ def _best_transcript_from_google(audio):
     Request multiple STT alternatives and choose the candidate that best matches
     known assistant command phrases.
     """
+    primary = normalize_voice_text(r.recognize_google(audio))
+    if primary:
+        # Fast-path: for most utterances this avoids the slower multi-alternative pass.
+        if len(primary.split()) >= 2:
+            return primary
+        if any(k in primary for k in ("omega", "open", "close", "click", "scroll", "search", "tab", "choose")):
+            return primary
+
     alt_data = r.recognize_google(audio, show_all=True)
     if isinstance(alt_data, dict):
         alternatives = alt_data.get("alternative", [])
         if alternatives:
-            ranked = [_score_command_candidate(candidate) for candidate in alternatives]
+            ranked = [_score_command_candidate(candidate) for candidate in alternatives[:6]]
             ranked = [item for item in ranked if item[1]]
             if ranked:
                 ranked.sort(key=lambda item: item[0], reverse=True)
                 return ranked[0][1]
-    return normalize_voice_text(r.recognize_google(audio))
+    return primary
 
 
 
@@ -2778,12 +2790,16 @@ def record_audio():
                 or (now - _last_ambient_calibration_at) > AMBIENT_RECALIBRATE_EVERY_SEC
             )
             if should_recalibrate:
-                r.adjust_for_ambient_noise(source, duration=0.35)
+                r.adjust_for_ambient_noise(source, duration=AMBIENT_CALIBRATION_DURATION_SEC)
                 _audio_calibrated = True
                 _last_ambient_calibration_at = now
 
             r.energy_threshold = max(180, int(r.energy_threshold))
-            audio = r.listen(source, timeout=None, phrase_time_limit=5)
+            audio = r.listen(
+                source,
+                timeout=LISTEN_TIMEOUT_SEC,
+                phrase_time_limit=LISTEN_PHRASE_TIME_LIMIT_SEC,
+            )
             
         try:
             voice_data = _best_transcript_from_google(audio)
@@ -2800,7 +2816,6 @@ def record_audio():
             return ""
             
     except sr.WaitTimeoutError:
-        print("Listening timeout")
         _voice_hide()
         return ""
     except Exception as e:
