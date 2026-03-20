@@ -169,6 +169,72 @@ APP_DIRECT_EXECUTABLES = {
     "excel": ["excel.exe"],
 }
 
+APP_DISCOVERY_CACHE_TTL_SEC = 120
+_apps_cache = {}
+_apps_cache_time = 0.0
+
+
+def _normalize_app_key(value: str) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", value.lower())).strip()
+
+
+def _add_app_entry(apps, name, target):
+    """Store multiple normalized aliases for better matching."""
+    if not name or not target:
+        return
+
+    raw_name = name.strip().lower()
+    norm_name = _normalize_app_key(name)
+
+    for key in (raw_name, norm_name):
+        if key:
+            apps[key] = target
+
+
+def _get_start_apps_from_os():
+    """Read Windows Start apps (Name + AppID) from this system."""
+    ps_cmd = (
+        "Get-StartApps | "
+        "Select-Object Name,AppID | "
+        "Where-Object { $_.Name -and $_.AppID } | "
+        "ConvertTo-Json -Depth 3"
+    )
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if result.returncode != 0:
+            return []
+
+        payload = (result.stdout or "").strip()
+        if not payload:
+            return []
+
+        data = json.loads(payload)
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            return []
+        return data
+    except Exception:
+        return []
+
+
+def _launch_app_user_model_id(app_id: str) -> bool:
+    if not app_id:
+        return False
+    try:
+        subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+        return True
+    except Exception:
+        return False
+
 def normalize_voice_text(text):
     """Normalize transcript to reduce STT noise before intent extraction."""
     if not text:
@@ -286,6 +352,12 @@ def get_all_installed_apps():
       - install folder (we will search .exe inside)
       - built-in executable name (e.g., 'notepad.exe')
     """
+    global _apps_cache, _apps_cache_time
+
+    now = time.time()
+    if _apps_cache and (now - _apps_cache_time) < APP_DISCOVERY_CACHE_TTL_SEC:
+        return dict(_apps_cache)
+
     apps = {}
 
     # A. Start Menu Shortcuts (.lnk)
@@ -297,7 +369,7 @@ def get_all_installed_apps():
         try:
             for shortcut in glob.glob(os.path.join(sm_path, "**", "*.lnk"), recursive=True):
                 name = os.path.splitext(os.path.basename(shortcut))[0].lower()
-                apps[name] = shortcut
+                _add_app_entry(apps, name, shortcut)
         except Exception:
             pass
 
@@ -323,13 +395,17 @@ def get_all_installed_apps():
                                 install_loc = None
 
                             if display_name:
-                                key = display_name.lower()
+                                key = display_name
                                 # prefer install location if available
                                 if install_loc:
-                                    apps[key] = install_loc
+                                    _add_app_entry(apps, key, install_loc)
                                 else:
                                     # keep what we have (maybe later Start Menu will override)
-                                    apps.setdefault(key, "") 
+                                    norm_key = _normalize_app_key(key)
+                                    if key.lower() not in apps:
+                                        apps[key.lower()] = ""
+                                    if norm_key and norm_key not in apps:
+                                        apps[norm_key] = ""
                     except Exception:
                         pass
         except Exception:
@@ -346,7 +422,7 @@ def get_all_installed_apps():
                         for f in os.listdir(folder_path):
                             if f.lower().endswith(".exe"):
                                 name = os.path.splitext(f)[0].lower()
-                                apps[name] = os.path.join(folder_path, f)
+                                _add_app_entry(apps, name, os.path.join(folder_path, f))
                     except Exception:
                         pass
         except Exception:
@@ -358,10 +434,11 @@ def get_all_installed_apps():
     for exe in system_tools:
         exe_path = os.path.join(sys32, exe)
         if os.path.exists(exe_path):
-            apps[os.path.splitext(exe)[0].lower()] = exe_path
+            _add_app_entry(apps, os.path.splitext(exe)[0].lower(), exe_path)
         else:
             # fallback to name only (os.startfile will handle these)
-            apps.setdefault(os.path.splitext(exe)[0].lower(), exe)
+            base = os.path.splitext(exe)[0].lower()
+            apps.setdefault(base, exe)
 
     # E. Portable EXEs in common user folders
     user_home = os.path.expanduser("~")
@@ -375,12 +452,39 @@ def get_all_installed_apps():
             try:
                 for exe in glob.glob(os.path.join(d, "**", "*.exe"), recursive=True):
                     name = os.path.splitext(os.path.basename(exe))[0].lower()
-                    apps[name] = exe
+                    _add_app_entry(apps, name, exe)
             except Exception:
                 pass
 
+    # F. Windows user-level app shims (Store/Desktop bridge apps)
+    user_windows_apps = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        "Microsoft",
+        "WindowsApps",
+    )
+    if os.path.isdir(user_windows_apps):
+        try:
+            for exe in glob.glob(os.path.join(user_windows_apps, "*.exe")):
+                name = os.path.splitext(os.path.basename(exe))[0].lower()
+                if name not in ("python", "python3"):
+                    _add_app_entry(apps, name, exe)
+        except Exception:
+            pass
+
+    # G. Start app catalog from OS (Get-StartApps -> AppUserModelID)
+    for entry in _get_start_apps_from_os():
+        try:
+            name = str(entry.get("Name", "")).strip()
+            app_id = str(entry.get("AppID", "")).strip()
+            if name and app_id:
+                _add_app_entry(apps, name, f"appid::{app_id}")
+        except Exception:
+            continue
+
     # Normalize: remove empty install locations for registry-only entries if Start Menu found later
     # (Start Menu/WindowsApps entries added earlier will override)
+    _apps_cache = dict(apps)
+    _apps_cache_time = now
     return apps
 
 
@@ -704,6 +808,10 @@ def _bring_app_window_to_front(query_terms):
 def _launch_target(target):
     if not target:
         return False
+
+    if isinstance(target, str) and target.startswith("appid::"):
+        app_id = target.split("appid::", 1)[1].strip()
+        return _launch_app_user_model_id(app_id)
 
     if target.lower().endswith(".lnk"):
         os.startfile(target)
