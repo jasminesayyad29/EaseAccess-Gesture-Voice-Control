@@ -48,6 +48,7 @@ except Exception:
 last_context = None   # possible values: None, 'presentation', 'browser', ...
 AUTO_RETURN_AFTER_SEARCH = False # Set True if you want automatic return after search
 last_found_boxes = []
+last_click_target_text = None
 
 paste_word_mode = None        # None, "before", or "after"
 paste_word_boxes = []         # boxes of the matched word(s)
@@ -3089,6 +3090,40 @@ def handle_wake_up():
     is_awake = True
     wish()
 
+
+def handle_discard_options():
+    """Dismiss any active on-screen option overlays and reset option state."""
+    global last_found_boxes, last_click_target_text
+    global last_tab_boxes, last_tab_target
+    global paste_position_mode, paste_position_boxes
+    global paste_word_mode, paste_word_boxes, paste_word_target
+    global range_mode, range_phase
+    global range_start_occurrences, range_end_occurrences
+    global range_start_phrase, range_end_phrase, range_selected_start
+
+    clear_on_screen_boxes()
+
+    last_found_boxes = []
+    last_click_target_text = None
+    last_tab_boxes = []
+    last_tab_target = None
+
+    paste_position_mode = None
+    paste_position_boxes = []
+    paste_word_mode = None
+    paste_word_boxes = []
+    paste_word_target = None
+
+    range_mode = None
+    range_phase = None
+    range_start_occurrences = []
+    range_end_occurrences = []
+    range_start_phrase = ""
+    range_end_phrase = ""
+    range_selected_start = None
+
+    reply("Okay, discarded the options.")
+
 def handle_open_app(app_name):
     if not app_name:
         reply("Which application should I open?")
@@ -3259,6 +3294,23 @@ def respond(voice_data):
         return
 
     pv = processed_voice
+
+    # Deterministic fast-path so dismiss works even if intent classification misses it.
+    if any(cmd in pv for cmd in (
+        "discard options",
+        "dismiss options",
+        "clear options",
+        "cancel options",
+        "close options",
+        "hide options",
+        "discard",
+        "dismiss",
+        "clear",
+        "cancel",
+        "close",
+    )):
+        handle_discard_options()
+        return
 
     # Deterministic app-open handling for:
     # - "open chrome"
