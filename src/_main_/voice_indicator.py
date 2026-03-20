@@ -21,6 +21,7 @@ class VoiceStateIndicator:
         self._ready = threading.Event()
         self._canvas = None
         self._emoji_item = None
+        self._text_item = None
         self._hide_after_id = None
 
     def _get_work_area(self):
@@ -70,13 +71,15 @@ class VoiceStateIndicator:
                 pass
             self._hide_after_id = None
 
-    def _set_symbol(self, symbol, auto_hide_ms=None):
+    def _set_symbol(self, symbol, recognized_text=None, auto_hide_ms=None):
         if not self._enabled or self._root is None or self._canvas is None or self._emoji_item is None:
             return
 
         def _apply():
             self._cancel_auto_hide()
             self._canvas.itemconfigure(self._emoji_item, text=symbol)
+            if self._text_item is not None and recognized_text is not None:
+                self._canvas.itemconfigure(self._text_item, text=recognized_text)
             self._root.deiconify()
             if auto_hide_ms is not None and auto_hide_ms > 0:
                 self._hide_after_id = self._root.after(auto_hide_ms, self._root.withdraw)
@@ -98,6 +101,10 @@ class VoiceStateIndicator:
                 pass
 
             icon_size, x, y = self._compute_geometry()
+            text_gap = max(8, int(round(icon_size * 0.20)))
+            text_area = int(max(120, min(420, icon_size * 4.8)))
+            total_w = icon_size + text_gap + text_area
+            total_h = icon_size
             card = tk.Frame(
                 self._root,
                 bg=TRANSPARENT_KEY,
@@ -105,13 +112,13 @@ class VoiceStateIndicator:
                 relief="flat",
                 highlightthickness=0,
                 highlightbackground=TRANSPARENT_KEY,
-                width=icon_size,
-                height=icon_size,
+                width=total_w,
+                height=total_h,
             )
             card.pack(fill="both", expand=True)
             card.pack_propagate(False)
 
-            self._canvas = tk.Canvas(card, width=icon_size, height=icon_size, bg=TRANSPARENT_KEY, highlightthickness=0)
+            self._canvas = tk.Canvas(card, width=total_w, height=total_h, bg=TRANSPARENT_KEY, highlightthickness=0)
             self._canvas.place(x=0, y=0)
 
             label_font = max(14, int(round(icon_size * 0.34)))
@@ -123,7 +130,17 @@ class VoiceStateIndicator:
                 font=("Segoe UI Emoji", label_font, "bold"),
             )
 
-            self._root.geometry(f"{icon_size}x{icon_size}+{x}+{y}")
+            text_font = max(10, int(round(icon_size * 0.22)))
+            self._text_item = self._canvas.create_text(
+                int(icon_size + text_gap),
+                int(icon_size * 0.50),
+                text="",
+                anchor="w",
+                fill="#ffffff",
+                font=("Segoe UI", text_font, "bold"),
+            )
+
+            self._root.geometry(f"{total_w}x{total_h}+{x}+{y}")
             self._root.withdraw()
             self._ready.set()
             self._root.mainloop()
@@ -144,12 +161,13 @@ class VoiceStateIndicator:
     def show_listening(self):
         if not self._ensure_started():
             return
-        self._set_symbol("🫧")
+        # Keep the last recognized text visible while listening.
+        self._set_symbol("🫧", recognized_text=None)
 
-    def show_recognized(self, auto_hide_ms=900):
+    def show_recognized(self, recognized_text="", auto_hide_ms=None):
         if not self._ensure_started():
             return
-        self._set_symbol("⚙️", auto_hide_ms=auto_hide_ms)
+        self._set_symbol("⚙️", recognized_text=recognized_text, auto_hide_ms=auto_hide_ms)
 
     def hide(self):
         if not self._enabled or self._root is None:

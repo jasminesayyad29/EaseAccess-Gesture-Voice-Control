@@ -38,6 +38,8 @@ import win32con
 import win32api
 import pythoncom
 import pychrome
+from queue import Queue, Empty, Full
+from threading import Thread, Event
 try:
     from voice_indicator import VoiceStateIndicator
 except Exception:
@@ -102,11 +104,11 @@ def _voice_show_listening():
         pass
 
 
-def _voice_show_recognized():
+def _voice_show_recognized(recognized_text=""):
     if voice_indicator is None:
         return
     try:
-        voice_indicator.show_recognized()
+        voice_indicator.show_recognized(recognized_text=recognized_text)
     except Exception:
         pass
 
@@ -149,6 +151,9 @@ WAKE_WORD_VARIANTS = (
 COMMON_STT_FIXES = {
     "omegle": "omega",
     "omagle": "omega",
+    "click on you": "click on two",
+    "click on to": "click on two",
+    "choose you": "choose two",
     "search four": "search for",
     "switch toe tab": "switch to tab",
     "switch two tab": "switch to tab",
@@ -180,6 +185,74 @@ _last_wake_detected_at = 0.0
 APP_DISCOVERY_CACHE_TTL_SEC = 120
 _apps_cache = {}
 _apps_cache_time = 0.0
+
+COMMAND_QUEUE_MAXSIZE = 32
+TTS_QUEUE_MAXSIZE = 32
+
+command_queue = Queue(maxsize=COMMAND_QUEUE_MAXSIZE)
+tts_queue = Queue(maxsize=TTS_QUEUE_MAXSIZE)
+shutdown_event = Event()
+
+
+def _enqueue_latest(q, item):
+    """Keep queue fresh under bursty input by dropping the oldest item if full."""
+    try:
+        q.put_nowait(item)
+    except Full:
+        try:
+            q.get_nowait()
+        except Empty:
+            pass
+        try:
+            q.put_nowait(item)
+        except Full:
+            pass
+
+
+def _tts_worker():
+    while not shutdown_event.is_set():
+        try:
+            msg = tts_queue.get(timeout=0.25)
+        except Empty:
+            continue
+
+        if msg is None:
+            break
+
+        if engine:
+            try:
+                engine.say(msg)
+                engine.runAndWait()
+            except Exception as e:
+                print(f"TTS error: {e}")
+
+
+def _should_allow_command(voice_data: str) -> bool:
+    global _last_wake_detected_at
+    normalized_voice = normalize_voice_text(voice_data)
+    wake_detected = any(w in normalized_voice for w in WAKE_WORD_VARIANTS)
+    if wake_detected:
+        _last_wake_detected_at = time.time()
+    return wake_detected or ((time.time() - _last_wake_detected_at) <= ACTIVE_COMMAND_WINDOW_SEC)
+
+
+def _command_worker():
+    while not shutdown_event.is_set():
+        try:
+            voice_data = command_queue.get(timeout=0.25)
+        except Empty:
+            continue
+
+        if voice_data is None:
+            break
+
+        try:
+            result = respond(voice_data)
+            if result == "exit":
+                shutdown_event.set()
+                break
+        except Exception as e:
+            print(f"Command worker error: {e}")
 
 
 def _normalize_app_key(value: str) -> str:
@@ -2435,13 +2508,8 @@ def reply(audio):
         return
 
     print(f"omega: {audio}")
-    
-    if engine:
-        try:
-            engine.say(audio)
-            engine.runAndWait()
-        except Exception as e:
-            print(f"TTS error: {e}")
+
+    _enqueue_latest(tts_queue, audio)
 
 def wish():
     hour = int(datetime.datetime.now().hour)
@@ -2640,7 +2708,7 @@ def record_audio():
             voice_data = _best_transcript_from_google(audio)
             voice_data = normalize_voice_text(voice_data)
             print(f"Recognized: {voice_data}")
-            _voice_show_recognized()
+            _voice_show_recognized(voice_data)
             return voice_data
         except sr.UnknownValueError:
             return ""
@@ -3285,6 +3353,36 @@ def handle_discard_options():
 
     reply("Okay, discarded the options.")
 
+
+def _has_pending_options():
+    return (
+        bool(last_tab_boxes)
+        or bool(last_found_boxes)
+        or (range_mode is not None)
+        or (paste_position_mode == "active")
+        or (paste_word_mode is not None)
+    )
+
+
+def _dispatch_option_number(num: int):
+    if not num:
+        reply("Please say a valid option number like choose one or choose two.")
+        return
+
+    if range_mode is not None:
+        handle_range_choice(num)
+        return
+
+    if paste_position_mode == "active":
+        handle_paste_position_choice(num)
+        return
+
+    if paste_word_mode is not None:
+        handle_paste_word_choice(num)
+        return
+
+    handle_choice_selection(num)
+
 def handle_open_app(app_name):
     if not app_name:
         reply("Which application should I open?")
@@ -3498,8 +3596,9 @@ def handle_presentation_control(command):
         reply("Sorry, I couldn’t control the presentation right now.")
 
 def handle_click_action(entity, full_cmd):
-    if not entity:
-        reply("What should I click on?")
+    if not entity or entity.strip() in {"", "here", "cursor", "current", "current position", "position"}:
+        pyautogui.click()
+        reply("Clicked.")
         return
     
     perform_click_action(
@@ -3546,6 +3645,13 @@ def respond(voice_data):
         close_candidate = normalize_close_app_query(pv)
         if close_candidate:
             handle_close_app(close_candidate)
+            return
+
+    # Fast path: when options are visible, allow phrases like 'click on two' immediately.
+    if _has_pending_options():
+        num = parse_choice_number(pv)
+        if num:
+            _dispatch_option_number(num)
             return
 
     # Deterministic app-open handling for:
@@ -3645,28 +3751,7 @@ def respond(voice_data):
         handle_wake_up()
 
     elif intent == 'choice_select':
-            num = parse_choice_number(entity)
-            if not num:
-                reply("Please say a valid option number like choose one or choose two.")
-                return
-
-            # 1️⃣ Range selection workflow (copy/select text)
-            if range_mode is not None:
-                handle_range_choice(num)
-                return
-
-            # 2️⃣ Paste-position mode (generic options-based paste)
-            if paste_position_mode == "active":
-                handle_paste_position_choice(num)
-                return
-
-            # 3️⃣ Word-based paste-before/after workflow
-            if paste_word_mode is not None:
-                handle_paste_word_choice(num)
-                return
-
-            # 4️⃣ Otherwise, original behavior for click/tab/other choices
-            handle_choice_selection(num)
+            _dispatch_option_number(parse_choice_number(entity))
 
 
     elif intent == 'presentation_control':
@@ -3691,39 +3776,38 @@ def respond(voice_data):
 if __name__ == "__main__":
     print(get_taskbar_buttons())    
 
+    tts_thread = Thread(target=_tts_worker, daemon=True)
+    cmd_thread = Thread(target=_command_worker, daemon=True)
+    tts_thread.start()
+    cmd_thread.start()
+
     wish()
-    
-    while True:
+
+    while not shutdown_event.is_set():
         try:
             # Take input from voice only
             voice_data = record_audio()
 
             # Process voice_data if we have input
             if voice_data:
-                # Check if omega is mentioned
-                normalized_voice = normalize_voice_text(voice_data)
-                wake_detected = any(w in normalized_voice for w in WAKE_WORD_VARIANTS)
-                if wake_detected:
-                    _last_wake_detected_at = time.time()
-
-                allow_command = wake_detected or ((time.time() - _last_wake_detected_at) <= ACTIVE_COMMAND_WINDOW_SEC)
-
-                if allow_command:
-                    result = respond(voice_data)
-                    if result == "exit":
-                        break
+                reply(f"I heard {voice_data}")
+                if _should_allow_command(voice_data):
+                    _enqueue_latest(command_queue, voice_data)
                     
             time.sleep(0.02)
                     
         except SystemExit:
-            reply("Exit Successful")
-            break
+            shutdown_event.set()
         except KeyboardInterrupt:
             reply("Interrupted by user")
-            break
+            shutdown_event.set()
         except Exception as e:
             print(f"Unexpected error: {e}")
             time.sleep(1)  # Prevent rapid error looping
 
+    _enqueue_latest(command_queue, None)
+    _enqueue_latest(tts_queue, None)
+    cmd_thread.join(timeout=1.2)
+    tts_thread.join(timeout=1.2)
     _voice_close()
     print("omega shutdown complete")
