@@ -143,10 +143,12 @@ last_chrome_tab_id = None
 current_chrome_tab_id = None
 
 WAKE_WORD_VARIANTS = (
-    "omega", "oh mega", "o mega", "ome ga", "amiga", "omegaa"
+    "omega", "oh mega", "o mega", "ome ga", "amiga", "omegaa", "omegle", "omagle"
 )
 
 COMMON_STT_FIXES = {
+    "omegle": "omega",
+    "omagle": "omega",
     "search four": "search for",
     "switch toe tab": "switch to tab",
     "switch two tab": "switch to tab",
@@ -168,6 +170,12 @@ APP_DIRECT_EXECUTABLES = {
     "powerpoint": ["powerpnt.exe"],
     "excel": ["excel.exe"],
 }
+
+AMBIENT_RECALIBRATE_EVERY_SEC = 90
+ACTIVE_COMMAND_WINDOW_SEC = 14
+_audio_calibrated = False
+_last_ambient_calibration_at = 0.0
+_last_wake_detected_at = 0.0
 
 APP_DISCOVERY_CACHE_TTL_SEC = 120
 _apps_cache = {}
@@ -280,6 +288,44 @@ def is_open_app_command(text):
     if words & file_hints:
         return False
     return True
+
+
+def normalize_close_app_query(text):
+    """Extract target app name from close-app phrasing."""
+    if not text:
+        return ""
+    cleaned = normalize_voice_text(text)
+    cleaned = re.sub(
+        r"\b(close|quit|exit|stop|end|terminate|kill|force|app|application|program|please|the)\b",
+        " ",
+        cleaned,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def is_close_app_command(text):
+    """Detect close-app intent for forms like 'close app chrome' and 'close chrome'."""
+    if not text:
+        return False
+
+    t = normalize_voice_text(text)
+    if not t:
+        return False
+
+    if any(k in t for k in ["discard options", "dismiss options", "clear options", "close options", "hide options"]):
+        return False
+
+    blocked = {"presentation", "slideshow", "full screen", "tab", "options"}
+    if any(k in t for k in blocked):
+        return False
+
+    verbs = ("close ", "quit ", "exit ", "stop ", "end ", "terminate ", "kill ")
+    if not t.startswith(verbs):
+        return False
+
+    candidate = normalize_close_app_query(t)
+    return bool(candidate)
 
 
 def chrome_get_tabs():
@@ -2573,13 +2619,22 @@ def navigate_back():
 
 # Audio to String with better error handling
 def record_audio():
+    global _audio_calibrated, _last_ambient_calibration_at
     try:
         _voice_show_listening()
         with sr.Microphone() as source:
-            r.adjust_for_ambient_noise(source, duration=0.8)
-            r.energy_threshold = max(220, int(r.energy_threshold))
-            print("Listening...")
-            audio = r.listen(source, timeout=6, phrase_time_limit=6)
+            now = time.time()
+            should_recalibrate = (
+                (not _audio_calibrated)
+                or (now - _last_ambient_calibration_at) > AMBIENT_RECALIBRATE_EVERY_SEC
+            )
+            if should_recalibrate:
+                r.adjust_for_ambient_noise(source, duration=0.35)
+                _audio_calibrated = True
+                _last_ambient_calibration_at = now
+
+            r.energy_threshold = max(180, int(r.energy_threshold))
+            audio = r.listen(source, timeout=None, phrase_time_limit=5)
             
         try:
             voice_data = _best_transcript_from_google(audio)
@@ -2588,8 +2643,6 @@ def record_audio():
             _voice_show_recognized()
             return voice_data
         except sr.UnknownValueError:
-            print("Could not understand audio")
-            _voice_hide()
             return ""
         except sr.RequestError as e:
             print(f"Speech recognition error: {e}")
@@ -3240,6 +3293,76 @@ def handle_open_app(app_name):
     if open_taskbar_app(target_name):
         return
 
+
+def handle_close_app(app_name):
+    """Close app windows first, then terminate remaining matching processes."""
+    target = normalize_close_app_query(app_name)
+    if not target:
+        reply("Which application should I close?")
+        return
+
+    query_terms = _app_alias_terms(target)
+    for canonical, aliases in APP_ALIAS_GROUPS.items():
+        if target == canonical or target in aliases:
+            query_terms.extend([canonical] + aliases)
+
+    query_terms = list({t for t in query_terms if t and len(t) > 1})
+    safe_block = {"omega", "voice", "assistant", "python"}
+
+    windows_closed = 0
+    try:
+        for title in gw.getAllTitles():
+            t = (title or "").lower().strip()
+            if not t:
+                continue
+            if any(term in t for term in query_terms if len(term) > 2):
+                wins = gw.getWindowsWithTitle(title)
+                for w in wins:
+                    try:
+                        w.close()
+                        windows_closed += 1
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    procs_stopped = 0
+    proc_terms = set(query_terms)
+    for canonical, executables in APP_DIRECT_EXECUTABLES.items():
+        if canonical in proc_terms:
+            proc_terms.update(os.path.splitext(e)[0].lower() for e in executables)
+
+    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        try:
+            pname = (proc.info.get("name") or "").lower()
+            pexe = os.path.basename(proc.info.get("exe") or "").lower()
+            pcmd = " ".join(proc.info.get("cmdline") or []).lower()
+            joined = f"{pname} {pexe} {pcmd}"
+
+            if any(b in joined for b in safe_block):
+                continue
+
+            if any(term in joined for term in proc_terms if len(term) > 2):
+                proc.terminate()
+                procs_stopped += 1
+        except Exception:
+            continue
+
+    if procs_stopped:
+        time.sleep(0.4)
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pname = (proc.info.get("name") or "").lower()
+                if any(term in pname for term in proc_terms if len(term) > 2):
+                    proc.kill()
+            except Exception:
+                continue
+
+    if windows_closed or procs_stopped:
+        reply(f"Closed {target}.")
+    else:
+        reply(f"I could not find a running app named {target} to close.")
+
 def handle_select_range(full_cmd: str):
     # Use shared range-selection engine (with disambiguation)
     start_range_selection(full_cmd, mode="select")
@@ -3415,10 +3538,15 @@ def respond(voice_data):
         "dismiss",
         "clear",
         "cancel",
-        "close",
     )):
         handle_discard_options()
         return
+
+    if is_close_app_command(pv):
+        close_candidate = normalize_close_app_query(pv)
+        if close_candidate:
+            handle_close_app(close_candidate)
+            return
 
     # Deterministic app-open handling for:
     # - "open chrome"
@@ -3575,15 +3703,17 @@ if __name__ == "__main__":
                 # Check if omega is mentioned
                 normalized_voice = normalize_voice_text(voice_data)
                 wake_detected = any(w in normalized_voice for w in WAKE_WORD_VARIANTS)
-
                 if wake_detected:
+                    _last_wake_detected_at = time.time()
+
+                allow_command = wake_detected or ((time.time() - _last_wake_detected_at) <= ACTIVE_COMMAND_WINDOW_SEC)
+
+                if allow_command:
                     result = respond(voice_data)
                     if result == "exit":
                         break
-                else:
-                    print("Voice activation word 'omega' not detected")
                     
-            time.sleep(0.1)  # Small delay to prevent CPU overuse
+            time.sleep(0.02)
                     
         except SystemExit:
             reply("Exit Successful")
