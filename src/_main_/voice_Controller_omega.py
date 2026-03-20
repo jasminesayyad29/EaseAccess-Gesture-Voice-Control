@@ -7,6 +7,7 @@ import datetime
 from pynput.keyboard import Key, Controller
 import pyautogui
 import sys
+import builtins
 import os
 import psutil
 from os import listdir
@@ -74,23 +75,28 @@ r.pause_threshold = 0.8
 r.phrase_threshold = 0.25
 r.non_speaking_duration = 0.4
 
-# Initialize text-to-speech engine with error handling
-try:
-    engine = pyttsx3.init('sapi5')
-except:
-    try:
-        engine = pyttsx3.init()
-    except Exception as e:
-        print(f"TTS initialization failed: {e}")
-        engine = None
+engine = None
 
-if engine:
+
+def _init_tts_engine():
+    """Initialize TTS in the same thread that will speak (important on Windows)."""
     try:
-        voices = engine.getProperty('voices')
+        local_engine = pyttsx3.init('sapi5')
+    except Exception:
+        try:
+            local_engine = pyttsx3.init()
+        except Exception as e:
+            print(f"TTS initialization failed: {e}")
+            return None
+
+    try:
+        voices = local_engine.getProperty('voices')
         if voices:
-            engine.setProperty('voice', voices[0].id)
-    except:
+            local_engine.setProperty('voice', voices[0].id)
+    except Exception:
         pass
+
+    return local_engine
 
 voice_indicator = VoiceStateIndicator() if VoiceStateIndicator is not None else None
 
@@ -149,6 +155,8 @@ WAKE_WORD_VARIANTS = (
 )
 
 COMMON_STT_FIXES = {
+    "thankyou": "thank you",
+    "thanks you": "thank you",
     "omegle": "omega",
     "omagle": "omega",
     "click on you": "click on two",
@@ -187,11 +195,31 @@ _apps_cache = {}
 _apps_cache_time = 0.0
 
 COMMAND_QUEUE_MAXSIZE = 32
-TTS_QUEUE_MAXSIZE = 32
+TTS_QUEUE_MAXSIZE = 256
 
 command_queue = Queue(maxsize=COMMAND_QUEUE_MAXSIZE)
 tts_queue = Queue(maxsize=TTS_QUEUE_MAXSIZE)
 shutdown_event = Event()
+
+_raw_print = builtins.print
+
+
+def print(*args, **kwargs):
+    """Print to console and mirror the same text to TTS when available."""
+    _raw_print(*args, **kwargs)
+
+    sep = kwargs.get("sep", " ")
+    try:
+        text = sep.join(str(a) for a in args).strip()
+    except Exception:
+        text = ""
+
+    if not text:
+        return
+
+    enqueue_fn = globals().get("_enqueue_tts")
+    if callable(enqueue_fn):
+        enqueue_fn(text)
 
 
 def _enqueue_latest(q, item):
@@ -209,11 +237,34 @@ def _enqueue_latest(q, item):
             pass
 
 
-def _tts_worker():
+def _enqueue_tts(msg):
+    if not msg:
+        return
     while not shutdown_event.is_set():
+        try:
+            tts_queue.put(msg, timeout=0.25)
+            return
+        except Full:
+            continue
+
+
+def _tts_worker():
+    global engine
+    try:
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
+
+    engine = _init_tts_engine()
+    if engine is None:
+        print("TTS engine unavailable in worker thread")
+
+    while True:
         try:
             msg = tts_queue.get(timeout=0.25)
         except Empty:
+            if shutdown_event.is_set():
+                continue
             continue
 
         if msg is None:
@@ -225,6 +276,22 @@ def _tts_worker():
                 engine.runAndWait()
             except Exception as e:
                 print(f"TTS error: {e}")
+    try:
+        pythoncom.CoUninitialize()
+    except Exception:
+        pass
+
+
+def is_thank_you_exit_command(text):
+    if not text:
+        return False
+    t = normalize_voice_text(text)
+    return t in {"thank you", "thanks", "thanks omega", "thank you omega", "thankyou"}
+
+
+def handle_thank_you_exit():
+    reply("You're welcome. Shutting down now.")
+    return "exit"
 
 
 def _should_allow_command(voice_data: str) -> bool:
@@ -2509,7 +2576,21 @@ def reply(audio):
 
     print(f"omega: {audio}")
 
-    _enqueue_latest(tts_queue, audio)
+
+def handle_scroll_command(full_cmd: str):
+    """Perform a smooth wheel-scroll at the current cursor position."""
+    cmd = normalize_voice_text(full_cmd)
+    is_up = "up" in cmd
+    wheel_delta = 50 if is_up else -50
+
+    try:
+        # Wheel event is delivered to the control under current cursor.
+        win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, wheel_delta, 0)
+    except Exception:
+        # Fallback for environments where low-level wheel event is blocked.
+        pyautogui.scroll(50 if is_up else -50)
+
+    reply("Scrolled up." if is_up else "Scrolled down.")
 
 def wish():
     hour = int(datetime.datetime.now().hour)
@@ -3646,6 +3727,13 @@ def respond(voice_data):
         if close_candidate:
             handle_close_app(close_candidate)
             return
+
+    if re.match(r"^scroll(?:\s|$)", pv):
+        handle_scroll_command(pv)
+        return
+
+    if is_thank_you_exit_command(pv):
+        return handle_thank_you_exit()
 
     # Fast path: when options are visible, allow phrases like 'click on two' immediately.
     if _has_pending_options():
