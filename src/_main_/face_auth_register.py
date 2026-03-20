@@ -1,3 +1,5 @@
+# to run , execute `python face_auth_register.py <username> --count 15`, replacing <name> with your desired identity prefix (e.g. aadar)
+
 import argparse
 import os
 import time
@@ -298,11 +300,16 @@ def _resolve_known_faces_folder(folder_arg: Optional[str]) -> str:
     if os.path.isabs(folder_candidate):
         return folder_candidate
 
-    local = os.path.join(script_dir, folder_candidate)
-    if os.path.exists(local):
-        return local
-
-    return os.path.join(os.getcwd(), folder_candidate)
+    # Prefer sibling of _main_ (src/known_faces) so registration and auth share one folder.
+    candidates = [
+        os.path.join(os.path.dirname(script_dir), folder_candidate),
+        os.path.join(script_dir, folder_candidate),
+        os.path.join(os.getcwd(), folder_candidate),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 
 def main():
@@ -314,7 +321,7 @@ def main():
     parser.add_argument(
         "--folder",
         default=None,
-        help="Known faces folder path (default: src/known_faces or ./known_faces)",
+        help="Known faces folder path (default: folder beside main.py, then local fallback)",
     )
 
     args = parser.parse_args()

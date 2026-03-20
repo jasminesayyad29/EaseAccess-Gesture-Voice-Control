@@ -18,6 +18,11 @@ try:
 except Exception:
     from face_auth import FaceAuthenticator
 
+try:
+    from gest_auth_indicator import DesktopAuthIndicator
+except Exception:
+    DesktopAuthIndicator = None
+
 pyautogui.FAILSAFE = False
 mp_drawing = mp.solutions.drawing_utils
 mp_hands = mp.solutions.hands
@@ -377,8 +382,6 @@ class Controller:
                 Controller.pinchmajorflag = True
             Controller.pinch_control(hand_result,Controller.changesystembrightness, Controller.changesystemvolume)
         
-
-
 class GestureController:
     gc_mode = 0
     cap = None
@@ -402,8 +405,8 @@ class GestureController:
         cv2.resizeWindow(PREVIEW_WINDOW_NAME, pip_width, pip_height)
 
         screen_w, screen_h = pyautogui.size()
-        pos_x = max(0, int(screen_w - pip_width - PIP_MARGIN))
-        pos_y = int(PIP_MARGIN)
+        pos_x = max(0, int((screen_w - pip_width) / 2))
+        pos_y = max(0, int((screen_h - pip_height) / 2))
         cv2.moveWindow(PREVIEW_WINDOW_NAME, pos_x, pos_y)
 
     @staticmethod
@@ -458,6 +461,10 @@ class GestureController:
     def __init__(self, disable_face_auth=False):
         print("Initializing GestureController...")
         self.disable_face_auth = bool(disable_face_auth)
+        self.preview_window_visible = False
+        self.desktop_indicator = DesktopAuthIndicator() if DesktopAuthIndicator is not None else None
+        self.prev_raw_authorized = False
+        self.minimize_after_auth_done = False
         
         # Initialize camera with error handling
         try:
@@ -500,6 +507,21 @@ class GestureController:
         self.last_authorized_time = 0.0
         print("GestureController initialized successfully")
 
+    def _show_preview_window(self):
+        if self.preview_window_visible:
+            return
+        self._configure_preview_window(int(self.CAM_WIDTH or 640), int(self.CAM_HEIGHT or 480))
+        self.preview_window_visible = True
+
+    def _hide_preview_window(self):
+        if not self.preview_window_visible:
+            return
+        try:
+            cv2.destroyWindow(PREVIEW_WINDOW_NAME)
+        except cv2.error:
+            pass
+        self.preview_window_visible = False
+
     def classify_hands(self, results):
         left, right = None, None
         try:
@@ -532,7 +554,8 @@ class GestureController:
             print("ERROR: Camera not available. Cannot start.")
             return
 
-        self._configure_preview_window(int(self.CAM_WIDTH or 640), int(self.CAM_HEIGHT or 480))
+        # Start in auth mode with centered preview visible.
+        self._show_preview_window()
         
         print("Gesture Controller Starting...")
         print("Press 'q' to quit, 'Enter' was causing issues")
@@ -578,6 +601,12 @@ class GestureController:
 
                             is_authorized = self.auth_gate_authorized
                             self.auth_error_count = 0
+
+                            if raw_is_authorized and not self.prev_raw_authorized:
+                                if self.desktop_indicator is not None and not self.minimize_after_auth_done:
+                                    self.desktop_indicator.minimize_all_windows()
+                                    self.minimize_after_auth_done = True
+                            self.prev_raw_authorized = raw_is_authorized
                             
                             # Draw face bounding box and status
                             if face_detected:
@@ -593,9 +622,14 @@ class GestureController:
                             # Do not instantly cut off gestures due to a transient auth exception.
                             is_authorized = (time.time() - self.last_authorized_time) <= AUTHORIZATION_HOLD_SECONDS
                             raw_is_authorized = is_authorized
+                            self.prev_raw_authorized = raw_is_authorized
                     
                     # Only process gestures if authorized
                     if is_authorized:
+                        if self.preview_window_visible:
+                            self._hide_preview_window()
+                        if self.desktop_indicator is not None:
+                            self.desktop_indicator.show()
                         try:
                             # Keep gesture behavior unchanged by processing a mirrored frame,
                             # then flip back only for display to avoid mirrored preview.
@@ -655,18 +689,22 @@ class GestureController:
                         except Exception as e:
                             print(f"Gesture processing error: {e}")
                     else:
-                        cv2.putText(image, "UNAUTHORIZED - Gestures disabled", 
+                        if self.desktop_indicator is not None:
+                            self.desktop_indicator.hide()
+                        if not self.preview_window_visible:
+                            self._show_preview_window()
+                        cv2.putText(image, "Authenticating...", 
                                    (50, image.shape[0]//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
                     if is_authorized:
                         image = cv2.flip(image, 1)
 
-                    if self.disable_face_auth:
-                        image = self._draw_preview_ui(image, True, True, None)
-                    else:
-                        image = self._draw_preview_ui(image, is_authorized, raw_is_authorized, self.face_auth)
-                    
-                    cv2.imshow(PREVIEW_WINDOW_NAME, image)
+                    if self.preview_window_visible:
+                        if self.disable_face_auth:
+                            image = self._draw_preview_ui(image, True, True, None)
+                        else:
+                            image = self._draw_preview_ui(image, is_authorized, raw_is_authorized, self.face_auth)
+                        cv2.imshow(PREVIEW_WINDOW_NAME, image)
                     
                     # Use 'q' instead of Enter for quitting
                     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -685,6 +723,9 @@ class GestureController:
                 raise
         
         finally:
+            if self.desktop_indicator is not None:
+                self.desktop_indicator.hide()
+                self.desktop_indicator.close()
             if self.cap:
                 self.cap.release()
             cv2.destroyAllWindows()
