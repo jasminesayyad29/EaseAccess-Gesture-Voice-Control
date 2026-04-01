@@ -1,2 +1,3 @@
 /src/known_faces/
-/src/_main_/__pycache__/
+__pycache__/
+*.pyc
