@@ -152,8 +152,20 @@ last_chrome_tab_id = None
 current_chrome_tab_id = None
 
 WAKE_WORD_VARIANTS = (
-    "omega", "oh mega", "o mega", "ome ga", "amiga", "omegaa", "omegle", "omagle"
+    "omega", "oh mega", "o mega", "ome ga", "amiga", "omegaa", "omegle", "omagle",
+    "mega", "ega", "ome"
 )
+
+EXIT_PHRASE_VARIANTS = {
+    "thank you",
+    "thank u",
+    "thanks",
+    "terminate",
+    "omega thank you",
+    "omega thank u",
+    "omega thanks",
+    "omega terminate",
+}
 
 COMMON_STT_FIXES = {
     "thankyou": "thank you",
@@ -186,7 +198,7 @@ APP_DIRECT_EXECUTABLES = {
 }
 
 AMBIENT_RECALIBRATE_EVERY_SEC = 90
-ACTIVE_COMMAND_WINDOW_SEC = 14
+ACTIVE_COMMAND_WINDOW_SEC = 15
 AMBIENT_CALIBRATION_DURATION_SEC = 0.18
 LISTEN_TIMEOUT_SEC = 1.2
 LISTEN_PHRASE_TIME_LIMIT_SEC = 2.8
@@ -290,7 +302,7 @@ def is_thank_you_exit_command(text):
     if not text:
         return False
     t = normalize_voice_text(text)
-    return t in {"thank you", "thanks", "thanks omega", "thank you omega", "thankyou"}
+    return t in EXIT_PHRASE_VARIANTS or t.replace("thanks you", "thank you") in EXIT_PHRASE_VARIANTS
 
 
 def handle_thank_you_exit():
@@ -402,9 +414,71 @@ def strip_wake_word(text):
     if not text:
         return ""
     output = text
-    for wake_word in WAKE_WORD_VARIANTS:
-        output = re.sub(rf"^\s*{re.escape(wake_word)}[\s,.:-]*", "", output, flags=re.IGNORECASE)
+    changed = True
+    while changed:
+        changed = False
+        for wake_word in WAKE_WORD_VARIANTS:
+            new_output = re.sub(rf"^\s*{re.escape(wake_word)}[\s,.:-]*", "", output, flags=re.IGNORECASE)
+            if new_output != output:
+                output = new_output.strip()
+                changed = True
     return output.strip()
+
+
+def _type_into_first_input_box(text):
+    """Best-effort type into the most likely input field on screen."""
+    if not text:
+        return False
+
+    cleaned_text = text.strip()
+    if not cleaned_text:
+        return False
+
+    try:
+        pyautogui.hotkey('ctrl', 'l')
+        time.sleep(0.05)
+        pyautogui.press('esc')
+        time.sleep(0.05)
+        pyautogui.press('tab')
+        time.sleep(0.15)
+        pyautogui.click()
+        time.sleep(0.05)
+        pyautogui.write(cleaned_text, interval=0.02)
+        return True
+    except Exception:
+        pass
+
+    try:
+        screen = ImageGrab.grab()
+        data = pytesseract.image_to_data(screen, output_type=Output.DICT)
+
+        candidates = []
+        for i, raw_text in enumerate(data.get("text", [])):
+            label = (raw_text or "").strip().lower()
+            if not label:
+                continue
+
+            if label in {"search", "type here", "enter text", "find", "google"}:
+                x = data["left"][i]
+                y = data["top"][i]
+                w = data["width"][i]
+                h = data["height"][i]
+                candidates.append((x, y, w, h))
+
+        if candidates:
+            x, y, w, h = sorted(candidates, key=lambda box: (box[1], box[0]))[0]
+            pyautogui.click(x + w // 2, y + h // 2)
+            time.sleep(0.1)
+            pyautogui.write(cleaned_text, interval=0.02)
+            return True
+    except Exception:
+        pass
+
+    try:
+        pyautogui.write(cleaned_text, interval=0.02)
+        return True
+    except Exception:
+        return False
 
 def normalize_app_query(text):
     """Extract app name from variants like 'open chrome' and 'open app chrome'."""
@@ -3766,6 +3840,22 @@ def respond(voice_data):
         if app_candidate:
             handle_open_app(app_candidate)
             return
+
+    if pv.startswith(("type ", "write ", "enter ", "send ")):
+        match = re.match(r"^(?:type|write|enter|send)\s+(.+)$", pv)
+        if match:
+            text_to_write = match.group(1).strip()
+            if text_to_write:
+                if _type_into_first_input_box(text_to_write):
+                    reply(f"Wrote {text_to_write}.")
+                else:
+                    reply("I could not focus the first input box.")
+                return
+
+    if pv in {"send", "enter"}:
+        pyautogui.press('enter')
+        reply("Pressed enter.")
+        return
 
         # Force Tab Control
     if "switch" in pv and "tab" in pv:
