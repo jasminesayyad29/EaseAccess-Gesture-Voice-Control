@@ -28,6 +28,7 @@ def _start_controller(
     label: str,
     extra_args=None,
     run_cwd: Optional[Path] = None,
+    hide_window: bool = False,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -38,6 +39,8 @@ def _start_controller(
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        if hide_window:
+            creationflags |= subprocess.CREATE_NO_WINDOW
 
     process = subprocess.Popen(
         [sys.executable, str(script_path), *extra_args],
@@ -96,6 +99,7 @@ def _register_user_if_needed(base_dir: Path, username: str) -> bool:
             str(known_faces_dir),
         ],
         cwd=str(base_dir),
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
 
     if result.returncode != 0:
@@ -134,6 +138,11 @@ def main():
     parser = argparse.ArgumentParser(description="Run registration check + voice + gesture controllers")
     parser.add_argument("--username", default=None, help="Username to verify/register face data")
     parser.add_argument(
+        "-auto",
+        action="store_true",
+        help="Run with the default username 'av' without prompting",
+    )
+    parser.add_argument(
         "-fd",
         "--face-disabled",
         action="store_true",
@@ -146,7 +155,10 @@ def main():
     voice_script = _resolve_script_path(base_dir, "voice_Controller_omega.py")
 
     raw_username = args.username
-    if not raw_username:
+    if not raw_username and args.auto:
+        raw_username = "av"
+        print("[MAIN] AUTO mode enabled. Using default username 'av'.")
+    elif not raw_username:
         raw_username = input("Enter username for face auth: ")
 
     username = _normalize_username(raw_username)
@@ -163,11 +175,18 @@ def main():
     print("[MAIN] Launching gesture and voice controllers...")
     print("[MAIN] Press Ctrl+C in this terminal to stop both.")
 
-    voice_proc = _start_controller(voice_script, "voice controller", run_cwd=base_dir)
+    hide_window = args.auto
+    voice_proc = _start_controller(voice_script, "voice controller", run_cwd=base_dir, hide_window=hide_window)
     # Small stagger helps camera and audio init avoid startup collisions.
     time.sleep(1.2)
     gesture_extra_args = ["-fd"] if args.face_disabled else []
-    gesture_proc = _start_controller(gesture_script, "gesture controller", gesture_extra_args, run_cwd=base_dir)
+    gesture_proc = _start_controller(
+        gesture_script,
+        "gesture controller",
+        gesture_extra_args,
+        run_cwd=base_dir,
+        hide_window=hide_window,
+    )
 
     should_restart_without_face_auth = False
 

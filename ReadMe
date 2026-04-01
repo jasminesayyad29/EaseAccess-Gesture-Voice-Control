@@ -30,3 +30,22 @@ Easy Setup Guide
    - Close the app
    - Run this command to start without face auth:
      `python main.py -fd`
+
+
+Auto-Run EaseAccess at Windows Startup :
+
+   a. press Win+R: 
+   b. enter `taskschd.msc` and click OK.
+   c. In the Task Scheduler window, click `Create Task` from the right-side panel.
+   d. Enter a name for the task, such as `EaseAccess Startup`, then click `Run only when user is logged on`.
+   e. Open the Triggers tab and click New, Choose `When I log on` as the trigger, click on `Any User` , Delay Task for `5 Seconds`, tick `Enabled` and then OK .
+   f. Go to the Actions tab and click New, Select `Start a program` as the action.
+   g. Browse and locate the pythonw.exe file in system, usually the file is at below location , but if not found, open CMD and run `where pythonw.exe`.
+         -Make sure to have field locations as below ↴ 
+
+                  Program/Script : `C:\Users\***username***\AppData\Local\Programs\Python\Python311\pythonw.exe` ~(pythonw.exe's path)
+                  Arguments : `C:\abc\*\xyz\**\src\main.py -auto`    ~(main.py path with `-auto` flag as mentioned)
+                  Starts In : `C:\abc\*\xyz\**\src`   ~(src folder's path)
+   h. Goto Conditions Tab ,Untick the `Start Only if Computer is on AC Power`checkbox and Tick the `Start Only If Network Connnection is Available` checkbox and select `Any Connection` in dropdown .
+   i. Review the settings and click Finish to save the task.
+   j. Sign Out/Restart/Shutdown your computer to confirm that EaseAccess starts automatically at startup.
