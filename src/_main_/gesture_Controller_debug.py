@@ -4,6 +4,7 @@ import pyautogui
 import math
 import argparse
 import sys
+import ctypes
 from enum import IntEnum
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
@@ -13,10 +14,29 @@ import time
 import traceback
 
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+
+def _enable_high_dpi_awareness():
+    if sys.platform != "win32":
+        return
+
+    try:
+        shcore = ctypes.windll.shcore
+        try:
+            shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_enable_high_dpi_awareness()
+
+FaceAuthenticator = None
 try:
     from face_auth_high_accuracy import FaceAuthenticatorHighAccuracy as FaceAuthenticator
 except Exception:
-    from face_auth import FaceAuthenticator
+    FaceAuthenticator = None
 
 try:
     from gest_auth_indicator import DesktopAuthIndicator
@@ -24,6 +44,9 @@ except Exception:
     DesktopAuthIndicator = None
 
 pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0
+if hasattr(pyautogui, "MINIMUM_DURATION"):
+    pyautogui.MINIMUM_DURATION = 0
 mp_drawing = mp.solutions.drawing_utils
 mp_hands = mp.solutions.hands
 
@@ -34,8 +57,17 @@ FACE_AUTH_FAILURE_EXIT_CODE = 86
 
 # Preview UI controls
 PREVIEW_WINDOW_NAME = 'EaseAccess Preview (Press Q to quit)'
-PIP_WIDTH = 420
-PIP_MARGIN = 24
+PIP_WIDTH = 360
+PIP_MARGIN = 20
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 60
+CURSOR_DEADZONE_PX = 4
+CURSOR_MIN_GAIN = 0.30
+CURSOR_MAX_GAIN = 2.40
+CURSOR_SMOOTHING = 0.28
+GESTURE_STABILITY_FRAMES = 2
+PRESENTATION_ACTION_COOLDOWN = 0.42
 
 print("=== GESTURE CONTROLLER DEBUG START ===")
 
@@ -71,6 +103,7 @@ class HandRecog:
         self.frame_count = 0
         self.hand_result = None
         self.hand_label = hand_label
+        self.last_presentation_action_time = 0.0
     
     def update_hand_result(self, hand_result):
         self.hand_result = hand_result
@@ -144,7 +177,7 @@ class HandRecog:
 
         self.prev_gesture = current_gesture
 
-        if self.frame_count > 4 :
+        if self.frame_count >= GESTURE_STABILITY_FRAMES:
             self.ori_gesture = current_gesture
         return self.ori_gesture
     
@@ -153,23 +186,24 @@ class HandRecog:
         if self.hand_result is None:
             return
 
-        # Get landmark references for thumb and index
+        now = time.monotonic()
+        if now - self.last_presentation_action_time < PRESENTATION_ACTION_COOLDOWN:
+            return self.ori_gesture
+
         thumb_tip = self.hand_result.landmark[4]
         thumb_ip = self.hand_result.landmark[3]
-        index_tip = self.hand_result.landmark[8]
-        wrist = self.hand_result.landmark[0]
 
         # 1️⃣ Next Slide (Thumb pointing right)
         if (thumb_tip.x > thumb_ip.x) and self.finger == Gest.THUMB:
             pyautogui.press('right')
+            self.last_presentation_action_time = now
             print("Next Slide")
-            time.sleep(0.7)  # small delay to avoid multiple triggers
 
         # 2️⃣ Previous Slide (Thumb pointing left)
         elif (thumb_tip.x < thumb_ip.x) and self.finger == Gest.THUMB:
             pyautogui.press('left')
+            self.last_presentation_action_time = now
             print("Previous Slide")
-            time.sleep(0.7)
 
         # 3️⃣ Zoom In (Pinch gesture where thumb and index move apart)
         # pinch_distance = math.sqrt(
@@ -205,7 +239,57 @@ class Controller:
     pinchlv = 0
     framecount = 0
     prev_hand = None
+    active_hand_key = None
+    prev_hand_positions = {}
+    cursor_positions = {}
     pinch_threshold = 0.3
+    dpi_level = 50
+
+    @staticmethod
+    def set_dpi_level(level):
+        try:
+            Controller.dpi_level = max(1, min(100, int(level)))
+        except Exception:
+            Controller.dpi_level = 50
+
+    @staticmethod
+    def _dpi_profile():
+        normalized = (Controller.dpi_level - 1) / 99.0
+        speed_curve = normalized ** 0.55
+        deadzone = max(1, int(round(6 - (5 * speed_curve))))
+        min_gain = 1.60 + (98.40 * speed_curve)
+        max_gain = 32.00 + (588.00 * speed_curve)
+        smoothing = 0.22 - (0.20 * speed_curve)
+        accel_divisor = 260.0 - (259.5 * speed_curve)
+        return deadzone, min_gain, max_gain, smoothing, accel_divisor
+
+    @staticmethod
+    def reset_control_state():
+        if Controller.grabflag:
+            try:
+                pyautogui.mouseUp(button="left")
+            except Exception:
+                pass
+        Controller.flag = False
+        Controller.grabflag = False
+        Controller.pinchmajorflag = False
+        Controller.pinchminorflag = False
+        Controller.pinchstartxcoord = None
+        Controller.pinchstartycoord = None
+        Controller.pinchdirectionflag = None
+        Controller.prevpinchlv = 0
+        Controller.pinchlv = 0
+        Controller.framecount = 0
+
+    @staticmethod
+    def reset_motion_state(hand_key=None):
+        if hand_key is None:
+            Controller.prev_hand_positions.clear()
+            Controller.cursor_positions.clear()
+            return
+
+        Controller.prev_hand_positions.pop(hand_key, None)
+        Controller.cursor_positions.pop(hand_key, None)
     
     @staticmethod
     def getpinchylv(hand_result):
@@ -278,28 +362,43 @@ class Controller:
 
 
     @staticmethod
-    def get_position(hand_result):
+    def get_position(hand_result, hand_key="default"):
         point = 9
         position = [hand_result.landmark[point].x ,hand_result.landmark[point].y]
         sx,sy = pyautogui.size()
         x_old,y_old = pyautogui.position()
-        x = int(position[0]*sx)
-        y = int(position[1]*sy)
-        if Controller.prev_hand is None:
-            Controller.prev_hand = x,y
-        delta_x = x - Controller.prev_hand[0]
-        delta_y = y - Controller.prev_hand[1]
-        distsq = delta_x**2 + delta_y**2
-        ratio = 1
-        Controller.prev_hand = [x,y]
-        if distsq <= 25:
-            ratio = 0
-        elif distsq <= 900:
-            ratio = 0.07 * (distsq ** (1/2))
-        else:
-            ratio = 2.1
-        x , y = x_old + delta_x*ratio , y_old + delta_y*ratio
-        return (x,y)
+        x = int(position[0] * sx)
+        y = int(position[1] * sy)
+        deadzone, min_gain, max_gain, smoothing, accel_divisor = Controller._dpi_profile()
+
+        previous_hand = Controller.prev_hand_positions.get(hand_key)
+        if previous_hand is None:
+            Controller.prev_hand_positions[hand_key] = (x, y)
+            Controller.cursor_positions[hand_key] = (x_old, y_old)
+            return (x_old, y_old)
+
+        delta_x = x - previous_hand[0]
+        delta_y = y - previous_hand[1]
+        distance = math.hypot(delta_x, delta_y)
+        Controller.prev_hand_positions[hand_key] = (x, y)
+
+        if distance <= deadzone:
+            Controller.cursor_positions[hand_key] = (x_old, y_old)
+            return (x_old, y_old)
+
+        gain = min(max_gain, max(min_gain, min_gain + (distance / accel_divisor)))
+        target_x = x_old + delta_x * gain
+        target_y = y_old + delta_y * gain
+
+        previous_cursor = Controller.cursor_positions.get(hand_key, (x_old, y_old))
+        smoothing = smoothing if distance < 220 else max(0.18, smoothing - 0.06)
+        x_pos = previous_cursor[0] + (target_x - previous_cursor[0]) * smoothing
+        y_pos = previous_cursor[1] + (target_y - previous_cursor[1]) * smoothing
+
+        x_pos = max(0, min(sx - 1, x_pos))
+        y_pos = max(0, min(sy - 1, y_pos))
+        Controller.cursor_positions[hand_key] = (x_pos, y_pos)
+        return (int(x_pos), int(y_pos))
 
     @staticmethod
     def pinch_control_init(hand_result):
@@ -334,15 +433,22 @@ class Controller:
                 Controller.prevpinchlv = lvx
                 Controller.framecount = 0
 
-    def handle_controls(gesture, hand_result, is_authorized):  
+    def handle_controls(gesture, hand_result, is_authorized, hand_key="default"):  
         """Only execute gestures if authorized"""
         if not is_authorized:
-            Controller.prev_hand = None
+            Controller.active_hand_key = None
+            Controller.reset_control_state()
+            Controller.reset_motion_state(hand_key)
             return
+
+        if Controller.active_hand_key != hand_key:
+            Controller.reset_control_state()
+            Controller.reset_motion_state(hand_key)
+            Controller.active_hand_key = hand_key
         
         x,y = None,None
         if gesture != Gest.PALM :
-            x,y = Controller.get_position(hand_result)
+            x,y = Controller.get_position(hand_result, hand_key)
         
         # flag reset
         if gesture != Gest.FIST and Controller.grabflag:
@@ -356,12 +462,12 @@ class Controller:
         # implementation
         if gesture == Gest.V_GEST:
             Controller.flag = True
-            pyautogui.moveTo(x, y, duration = 0.1)
+            pyautogui.moveTo(x, y)
         elif gesture == Gest.FIST:
             if not Controller.grabflag : 
                 Controller.grabflag = True
                 pyautogui.mouseDown(button = "left")
-            pyautogui.moveTo(x, y, duration = 0.1)
+            pyautogui.moveTo(x, y)
         elif gesture == Gest.MID and Controller.flag:
             pyautogui.click()
             Controller.flag = False
@@ -397,6 +503,16 @@ class GestureController:
     max_auth_errors = 20
 
     @staticmethod
+    def _gesture_priority(gesture):
+        if gesture in (Gest.FIST, Gest.V_GEST):
+            return 3
+        if gesture in (Gest.PINCH_MAJOR, Gest.PINCH_MINOR):
+            return 2
+        if gesture in (Gest.MID, Gest.INDEX, Gest.TWO_FINGER_CLOSED):
+            return 1
+        return 0
+
+    @staticmethod
     def _configure_preview_window(frame_width, frame_height):
         cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.setWindowProperty(PREVIEW_WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
@@ -405,8 +521,8 @@ class GestureController:
         cv2.resizeWindow(PREVIEW_WINDOW_NAME, pip_width, pip_height)
 
         screen_w, screen_h = pyautogui.size()
-        pos_x = max(0, int((screen_w - pip_width) / 2))
-        pos_y = max(0, int((screen_h - pip_height) / 2))
+        pos_x = max(0, int(screen_w - pip_width - PIP_MARGIN))
+        pos_y = max(0, int(screen_h - pip_height - PIP_MARGIN))
         cv2.moveWindow(PREVIEW_WINDOW_NAME, pos_x, pos_y)
 
     @staticmethod
@@ -458,9 +574,11 @@ class GestureController:
 
         return image
 
-    def __init__(self, disable_face_auth=False):
+    def __init__(self, disable_face_auth=False, dpi_level=50):
         print("Initializing GestureController...")
         self.disable_face_auth = bool(disable_face_auth)
+        Controller.set_dpi_level(dpi_level)
+        print(f"Cursor DPI control set to {Controller.dpi_level}/100")
         self.preview_window_visible = False
         self.desktop_indicator = DesktopAuthIndicator() if DesktopAuthIndicator is not None else None
         self.prev_raw_authorized = False
@@ -478,8 +596,10 @@ class GestureController:
                 return
             
             # Set camera properties
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            self.cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
             self.CAM_HEIGHT = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
             self.CAM_WIDTH = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -495,6 +615,8 @@ class GestureController:
             self.face_auth = None
             print("Face authentication disabled (-fd mode)")
         else:
+            if FaceAuthenticator is None:
+                raise RuntimeError("face auth module unavailable")
             try:
                 self.face_auth = FaceAuthenticator()
                 print("Face authentication initialized")
@@ -524,23 +646,22 @@ class GestureController:
 
     def classify_hands(self, results):
         left, right = None, None
-        try:
-            handedness_dict = MessageToDict(results.multi_handedness[0])
-            if handedness_dict['classification'][0]['label'] == 'Right':
-                right = results.multi_hand_landmarks[0]
-            else:
-                left = results.multi_hand_landmarks[0]
-        except:
-            pass
+        if not results.multi_hand_landmarks or not results.multi_handedness:
+            self.hr_major = None
+            self.hr_minor = None
+            return
 
-        try:
-            handedness_dict = MessageToDict(results.multi_handedness[1])
-            if handedness_dict['classification'][0]['label'] == 'Right':
-                right = results.multi_hand_landmarks[1]
+        for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            try:
+                handedness_dict = MessageToDict(handedness)
+                label = handedness_dict['classification'][0]['label']
+            except Exception:
+                continue
+
+            if label == 'Right':
+                right = hand_landmarks
             else:
-                left = results.multi_hand_landmarks[1]
-        except:
-            pass
+                left = hand_landmarks
         
         if self.dom_hand:
             self.hr_major = right
@@ -564,7 +685,7 @@ class GestureController:
         handminor = HandRecog(HLabel.MINOR)
 
         try:
-            with mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands:
+            with mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.7) as hands:
                 print("MediaPipe Hands model loaded")
                 
                 frame_count = 0
@@ -658,31 +779,50 @@ class GestureController:
                                 if VERBOSE_FRAME_LOGS:
                                     print(f"Frame {frame_count}: Hands detected")
                                 self.classify_hands(results)
-                                handmajor.update_hand_result(self.hr_major)
-                                handminor.update_hand_result(self.hr_minor)
+                                hand_states = []
 
-                                handmajor.set_finger_state()
-                                handminor.set_finger_state()
-                                # Update gestures
-                                gest_name_minor = handminor.get_gesture()
-                                gest_name_major = handmajor.get_gesture()
-
-                                # Handle standard mouse/volume/brightness gestures
-                                if gest_name_minor == Gest.PINCH_MINOR:
-                                    Controller.handle_controls(gest_name_minor, handminor.hand_result, is_authorized)
+                                if self.hr_major is not None:
+                                    handmajor.update_hand_result(self.hr_major)
+                                    handmajor.set_finger_state()
+                                    major_gesture = handmajor.get_gesture()
+                                    hand_states.append(("right", handmajor, major_gesture))
                                 else:
-                                    Controller.handle_controls(gest_name_major, handmajor.hand_result, is_authorized)
+                                    handmajor.update_hand_result(None)
 
-                                # ---------- NEW: Presentation Controls ----------
-                                # Call perform_presentation_action() for both hands
-                                handmajor.perform_presentation_action()
-                                handminor.perform_presentation_action()
+                                if self.hr_minor is not None:
+                                    handminor.update_hand_result(self.hr_minor)
+                                    handminor.set_finger_state()
+                                    minor_gesture = handminor.get_gesture()
+                                    hand_states.append(("left", handminor, minor_gesture))
+                                else:
+                                    handminor.update_hand_result(None)
+
+                                control_candidates = [
+                                    (GestureController._gesture_priority(gesture), hand_key, tracker, gesture)
+                                    for hand_key, tracker, gesture in hand_states
+                                    if gesture != Gest.PALM
+                                ]
+
+                                if control_candidates:
+                                    _, hand_key, tracker, gesture = max(
+                                        control_candidates,
+                                        key=lambda item: (item[0], item[1] == Controller.active_hand_key),
+                                    )
+                                    Controller.handle_controls(gesture, tracker.hand_result, is_authorized, hand_key=hand_key)
+                                else:
+                                    Controller.active_hand_key = None
+                                    Controller.reset_control_state()
+
+                                for hand_key, tracker, _gesture in hand_states:
+                                    tracker.perform_presentation_action()
 
                                 
                                 for hand_landmarks in results.multi_hand_landmarks:
                                     mp_drawing.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
                             else:
-                                Controller.prev_hand = None
+                                Controller.active_hand_key = None
+                                Controller.reset_control_state()
+                                Controller.reset_motion_state()
                                 if VERBOSE_FRAME_LOGS:
                                     print(f"Frame {frame_count}: No hands detected")
                         
@@ -735,10 +875,11 @@ if __name__ == "__main__":
     print("=== MAIN EXECUTION START ===")
     parser = argparse.ArgumentParser(description="Gesture controller")
     parser.add_argument("-fd", "--face-disabled", action="store_true", help="Disable face auth gate")
+    parser.add_argument("--dpi", type=int, default=50, choices=range(1, 101), metavar="1-100", help="Cursor sensitivity / DPI control (1-100)")
     args = parser.parse_args()
 
     try:
-        gc = GestureController(disable_face_auth=args.face_disabled)
+        gc = GestureController(disable_face_auth=args.face_disabled, dpi_level=args.dpi)
         if gc.cap and gc.cap.isOpened():
             gc.start()
         else:
