@@ -12,6 +12,8 @@ from google.protobuf.json_format import MessageToDict
 import screen_brightness_control as sbcontrol
 import time
 import traceback
+import win32con
+import win32gui
 
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
@@ -57,7 +59,7 @@ FACE_AUTH_FAILURE_EXIT_CODE = 86
 
 # Preview UI controls
 PREVIEW_WINDOW_NAME = 'EaseAccess Preview (Press Q to quit)'
-PIP_WIDTH = 360
+PIP_WIDTH = 468
 PIP_MARGIN = 20
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
@@ -66,8 +68,27 @@ CURSOR_DEADZONE_PX = 4
 CURSOR_MIN_GAIN = 0.30
 CURSOR_MAX_GAIN = 2.40
 CURSOR_SMOOTHING = 0.28
-GESTURE_STABILITY_FRAMES = 2
+GESTURE_STABILITY_FRAMES = 3
 PRESENTATION_ACTION_COOLDOWN = 0.42
+WINDOW_SWITCH_COOLDOWN = 1.1
+WINDOW_SWITCH_MAX_HISTORY = 22
+WINDOW_SWITCH_MIN_STEP = 0.025
+WINDOW_SWITCH_MIN_SIDE = 0.22
+WINDOW_SWITCH_MAX_SIDE_RATIO = 1.9
+WINDOW_SWITCH_CLOSURE_TOLERANCE = 0.12
+WINDOW_SWITCH_AXIS_RATIO = 1.18
+WINDOW_SWITCH_STEP_COOLDOWN = 0.05
+WINDOW_SWITCH_POST_SWITCH_HOLD_SECONDS = 0.5
+WINDOW_SWITCH_SESSION_IDLE_TIMEOUT = 0.85
+WINDOW_SWITCH_FINGER_PATTERN = 14
+HAND_DETECTION_CONFIDENCE = 0.7
+HAND_TRACKING_CONFIDENCE = 0.8
+FINGER_EXTENSION_ANGLE_DEGREES = 160.0
+FINGER_EXTENSION_WRIST_RATIO = 1.04
+WINDOW_SWITCH_HORIZONTAL_THRESHOLD = 0.004
+WINDOW_SWITCH_SMOOTHING_ALPHA = 0.35
+WINDOW_SWITCH_DIRECTION_HOLD_FRAMES = 2
+WINDOW_SWITCH_VERTICAL_THRESHOLD = 0.0025
 
 print("=== GESTURE CONTROLLER DEBUG START ===")
 
@@ -104,6 +125,25 @@ class HandRecog:
         self.hand_result = None
         self.hand_label = hand_label
         self.last_presentation_action_time = 0.0
+        self.window_switch_points = []
+        self.last_window_switch_action_time = 0.0
+        self.window_switch_alt_held = False
+        self.window_switch_last_axis = None
+        self.window_switch_last_sign = 0
+        self.window_switch_vertical_last_sign = 0
+        self.window_switch_last_x = None
+        self.window_switch_last_y = None
+        self.window_switch_smoothed_x = None
+        self.window_switch_smoothed_y = None
+        self.window_switch_direction_hold = 0
+        self.window_switch_last_motion_time = 0.0
+        self.window_switch_turn_count = 0
+        self.desktop_switch_last_sign = 0
+        self.desktop_switch_last_x = None
+        self.desktop_switch_smoothed_x = None
+        self.desktop_switch_direction_hold = 0
+        self.desktop_switch_last_motion_time = 0.0
+        self.desktop_switch_last_action_time = 0.0
     
     def update_hand_result(self, hand_result):
         self.hand_result = hand_result
@@ -125,24 +165,217 @@ class HandRecog:
     
     def get_dz(self,point):
         return abs(self.hand_result.landmark[point[0]].z - self.hand_result.landmark[point[1]].z)
+
+    def _joint_angle_degrees(self, first_point, joint_point, third_point):
+        first = self.hand_result.landmark[first_point]
+        joint = self.hand_result.landmark[joint_point]
+        third = self.hand_result.landmark[third_point]
+
+        first_vector_x = first.x - joint.x
+        first_vector_y = first.y - joint.y
+        third_vector_x = third.x - joint.x
+        third_vector_y = third.y - joint.y
+
+        first_length = math.hypot(first_vector_x, first_vector_y)
+        third_length = math.hypot(third_vector_x, third_vector_y)
+        if first_length == 0.0 or third_length == 0.0:
+            return 0.0
+
+        cosine = (first_vector_x * third_vector_x + first_vector_y * third_vector_y) / (first_length * third_length)
+        cosine = max(-1.0, min(1.0, cosine))
+        return math.degrees(math.acos(cosine))
+
+    def _finger_is_extended(self, mcp_point, pip_point, tip_point):
+        angle = self._joint_angle_degrees(mcp_point, pip_point, tip_point)
+        wrist = self.hand_result.landmark[0]
+        pip = self.hand_result.landmark[pip_point]
+        tip = self.hand_result.landmark[tip_point]
+
+        pip_distance = math.hypot(pip.x - wrist.x, pip.y - wrist.y)
+        tip_distance = math.hypot(tip.x - wrist.x, tip.y - wrist.y)
+
+        return angle >= FINGER_EXTENSION_ANGLE_DEGREES and tip_distance >= (pip_distance * FINGER_EXTENSION_WRIST_RATIO)
+
+    def _window_switch_begin_session(self, now, axis, sign):
+        if not self.window_switch_alt_held:
+            pyautogui.keyDown('alt')
+            self.window_switch_alt_held = True
+
+        self.window_switch_last_axis = axis
+        self.window_switch_last_sign = sign
+        self.window_switch_turn_count = 0
+        self.window_switch_last_motion_time = now
+
+    def _window_switch_end_session(self):
+        if self.window_switch_alt_held:
+            try:
+                pyautogui.keyUp('alt')
+            except Exception:
+                pass
+
+        self.window_switch_alt_held = False
+        self.window_switch_last_axis = None
+        self.window_switch_last_sign = 0
+        self.window_switch_vertical_last_sign = 0
+        self.window_switch_last_x = None
+        self.window_switch_last_y = None
+        self.window_switch_smoothed_x = None
+        self.window_switch_smoothed_y = None
+        self.window_switch_direction_hold = 0
+        self.window_switch_last_motion_time = 0.0
+        self.window_switch_turn_count = 0
+
+    def _window_switch_pose_active(self):
+        if self.hand_result is None:
+            return False
+
+        return self.finger == WINDOW_SWITCH_FINGER_PATTERN
+
+    def _window_switch_point(self):
+        landmarks = self.hand_result.landmark
+        centroid_x = (landmarks[8].x + landmarks[12].x + landmarks[16].x) / 3.0
+        centroid_y = (landmarks[8].y + landmarks[12].y + landmarks[16].y) / 3.0
+        palm_span = math.hypot(landmarks[9].x - landmarks[0].x, landmarks[9].y - landmarks[0].y)
+        palm_span = max(0.05, palm_span)
+        return (centroid_x / palm_span, centroid_y / palm_span)
+
+    def _window_switch_horizontal_point(self):
+        landmarks = self.hand_result.landmark
+        return (landmarks[8].x + landmarks[12].x + landmarks[16].x) / 3.0
+
+    def _window_switch_vertical_point(self):
+        landmarks = self.hand_result.landmark
+        return (landmarks[8].y + landmarks[12].y + landmarks[16].y) / 3.0
+
+    def _desktop_switch_pose_active(self):
+        if self.hand_result is None:
+            return False
+
+        return self.finger == Gest.LAST4
+
+    def _desktop_switch_horizontal_point(self):
+        landmarks = self.hand_result.landmark
+        return (landmarks[8].x + landmarks[12].x + landmarks[16].x + landmarks[20].x) / 4.0
+
+    def _desktop_switch_end_session(self):
+        self.desktop_switch_last_sign = 0
+        self.desktop_switch_last_x = None
+        self.desktop_switch_smoothed_x = None
+        self.desktop_switch_direction_hold = 0
+        self.desktop_switch_last_motion_time = 0.0
+        self.desktop_switch_last_action_time = 0.0
+
+    def _window_switch_minimize_all_windows(self):
+        try:
+            def minimize_window(hwnd, _extra):
+                try:
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return
+                    win32gui.ShowWindow(hwnd, win32con.SW_FORCEMINIMIZE)
+                except Exception:
+                    pass
+
+            win32gui.EnumWindows(minimize_window, None)
+            return
+        except Exception:
+            pass
+
+        if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "user32"):
+            user32 = ctypes.windll.user32
+            VK_LWIN = 0x5B
+            VK_D = 0x44
+            KEYEVENTF_KEYUP = 0x0002
+            user32.keybd_event(VK_LWIN, 0, 0, 0)
+            user32.keybd_event(VK_D, 0, 0, 0)
+            user32.keybd_event(VK_D, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+            return
+
+        pyautogui.hotkey('win', 'd')
+
+    def _compress_window_switch_path(self, points):
+        compressed = [points[0]]
+        for point in points[1:]:
+            if math.hypot(point[0] - compressed[-1][0], point[1] - compressed[-1][1]) >= WINDOW_SWITCH_MIN_STEP:
+                compressed.append(point)
+        return compressed
+
+    def _direction_from_segment(self, start_point, end_point):
+        delta_x = end_point[0] - start_point[0]
+        delta_y = end_point[1] - start_point[1]
+        magnitude = math.hypot(delta_x, delta_y)
+        if magnitude < WINDOW_SWITCH_MIN_STEP:
+            return None
+
+        if abs(delta_x) >= abs(delta_y) * WINDOW_SWITCH_AXIS_RATIO:
+            return ("h", 1 if delta_x > 0 else -1, magnitude)
+        if abs(delta_y) >= abs(delta_x) * WINDOW_SWITCH_AXIS_RATIO:
+            return ("v", 1 if delta_y > 0 else -1, magnitude)
+        return None
+
+    def _is_window_switch_pattern(self):
+        if len(self.window_switch_points) < 6:
+            return False
+
+        points = self._compress_window_switch_path(self.window_switch_points[-WINDOW_SWITCH_MAX_HISTORY:])
+        if len(points) < 6:
+            return False
+
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        span_x = max(xs) - min(xs)
+        span_y = max(ys) - min(ys)
+        if span_x < WINDOW_SWITCH_MIN_SIDE or span_y < WINDOW_SWITCH_MIN_SIDE:
+            return False
+
+        side_ratio = span_x / max(span_y, 1e-6)
+        if side_ratio > WINDOW_SWITCH_MAX_SIDE_RATIO or side_ratio < (1.0 / WINDOW_SWITCH_MAX_SIDE_RATIO):
+            return False
+
+        if math.hypot(points[-1][0] - points[0][0], points[-1][1] - points[0][1]) > WINDOW_SWITCH_CLOSURE_TOLERANCE:
+            return False
+
+        directions = []
+        for start_point, end_point in zip(points, points[1:]):
+            segment = self._direction_from_segment(start_point, end_point)
+            if segment is None:
+                return False
+
+            axis, sign, magnitude = segment
+            if magnitude < WINDOW_SWITCH_MIN_STEP:
+                continue
+
+            if not directions or directions[-1][:2] != (axis, sign):
+                directions.append((axis, sign))
+
+        if len(directions) < 4:
+            return False
+
+        first_four = directions[:4]
+        axes = [item[0] for item in first_four]
+        signs = [item[1] for item in first_four]
+
+        if axes[0] == axes[1] or axes[1] == axes[2] or axes[2] == axes[3]:
+            return False
+
+        if signs[0] == signs[2] or signs[1] == signs[3]:
+            return False
+
+        return True
     
     def set_finger_state(self):
         if self.hand_result == None:
             return
 
-        points = [[8,5,0],[12,9,0],[16,13,0],[20,17,0]]
-        self.finger = 0
-        self.finger = self.finger | 0
-        for idx,point in enumerate(points):
-            dist = self.get_signed_dist(point[:2])
-            dist2 = self.get_signed_dist(point[1:])
-            try:
-                ratio = round(dist/dist2,1)
-            except:
-                ratio = round(dist/0.01,1)
-            self.finger = self.finger << 1
-            if ratio > 0.5 :
-                self.finger = self.finger | 1
+        finger_points = [[5, 6, 8], [9, 10, 12], [13, 14, 16], [17, 18, 20]]
+        finger_state = 0
+
+        for mcp_point, pip_point, tip_point in finger_points:
+            finger_state = finger_state << 1
+            if self._finger_is_extended(mcp_point, pip_point, tip_point):
+                finger_state = finger_state | 1
+
+        self.finger = finger_state
 
     def get_gesture(self):
         if self.hand_result == None:
@@ -176,6 +409,10 @@ class HandRecog:
             self.frame_count = 0
 
         self.prev_gesture = current_gesture
+
+        if self.finger in (WINDOW_SWITCH_FINGER_PATTERN, Gest.LAST4):
+            self.ori_gesture = Gest.PALM
+            return self.ori_gesture
 
         if self.frame_count >= GESTURE_STABILITY_FRAMES:
             self.ori_gesture = current_gesture
@@ -221,6 +458,170 @@ class HandRecog:
         #     time.sleep(0.5)
 
         return self.ori_gesture
+
+    def perform_window_switch_action(self):
+        if self.hand_result is None:
+            self.window_switch_points.clear()
+            self._window_switch_end_session()
+            return
+
+        now = time.monotonic()
+        if not self._window_switch_pose_active():
+            self.window_switch_points.clear()
+            self._window_switch_end_session()
+            return
+
+        current_x = self._window_switch_horizontal_point()
+
+        if self.window_switch_last_x is None or self.window_switch_smoothed_x is None:
+            self.window_switch_last_x = current_x
+            self.window_switch_smoothed_x = current_x
+            self.window_switch_last_y = self._window_switch_vertical_point()
+            self.window_switch_smoothed_y = self.window_switch_last_y
+            self.window_switch_direction_hold = 0
+            if not self.window_switch_alt_held:
+                pyautogui.keyDown('alt')
+                self.window_switch_alt_held = True
+            self.window_switch_last_motion_time = now
+            return
+
+        current_y = self._window_switch_vertical_point()
+        self.window_switch_smoothed_x = (
+            WINDOW_SWITCH_SMOOTHING_ALPHA * current_x
+            + (1.0 - WINDOW_SWITCH_SMOOTHING_ALPHA) * self.window_switch_smoothed_x
+        )
+        self.window_switch_smoothed_y = (
+            WINDOW_SWITCH_SMOOTHING_ALPHA * current_y
+            + (1.0 - WINDOW_SWITCH_SMOOTHING_ALPHA) * self.window_switch_smoothed_y
+        )
+        delta_x = self.window_switch_smoothed_x - self.window_switch_last_x
+        delta_y = self.window_switch_smoothed_y - self.window_switch_last_y
+
+        if abs(delta_y) >= WINDOW_SWITCH_VERTICAL_THRESHOLD and abs(delta_y) >= abs(delta_x) * 1.05:
+            direction_sign = 1 if delta_y > 0 else -1
+            if direction_sign != self.window_switch_vertical_last_sign:
+                self.window_switch_vertical_last_sign = direction_sign
+                self.window_switch_direction_hold = 0
+                self.window_switch_last_x = self.window_switch_smoothed_x
+                self.window_switch_last_y = self.window_switch_smoothed_y
+                self.window_switch_last_motion_time = now
+
+                if direction_sign > 0:
+                    self._window_switch_minimize_all_windows()
+                    print("Minimize All Windows")
+                
+            return
+
+        if abs(delta_x) < WINDOW_SWITCH_HORIZONTAL_THRESHOLD:
+            if self.window_switch_alt_held and (now - self.window_switch_last_motion_time > WINDOW_SWITCH_SESSION_IDLE_TIMEOUT):
+                self.window_switch_points.clear()
+                self._window_switch_end_session()
+            return
+
+        direction_sign = 1 if delta_x > 0 else -1
+        if direction_sign != self.window_switch_last_sign:
+            self.window_switch_last_sign = direction_sign
+            self.window_switch_direction_hold = 1
+            self.window_switch_last_x = self.window_switch_smoothed_x
+            self.window_switch_last_motion_time = now
+            return
+
+        self.window_switch_direction_hold += 1
+        if self.window_switch_direction_hold < WINDOW_SWITCH_DIRECTION_HOLD_FRAMES:
+            self.window_switch_last_x = self.window_switch_smoothed_x
+            self.window_switch_last_motion_time = now
+            return
+
+        if now - self.last_window_switch_action_time < WINDOW_SWITCH_POST_SWITCH_HOLD_SECONDS:
+            self.window_switch_last_x = self.window_switch_smoothed_x
+            self.window_switch_last_motion_time = now
+            self.window_switch_direction_hold = 0
+            return
+
+        if now - self.last_window_switch_action_time < WINDOW_SWITCH_STEP_COOLDOWN:
+            self.window_switch_last_x = self.window_switch_smoothed_x
+            self.window_switch_last_motion_time = now
+            return
+
+        if direction_sign > 0:
+            pyautogui.press('tab')
+        else:
+            pyautogui.keyDown('shift')
+            pyautogui.press('tab')
+            pyautogui.keyUp('shift')
+
+        self.last_window_switch_action_time = now
+        self.window_switch_last_x = self.window_switch_smoothed_x
+        self.window_switch_last_y = self.window_switch_smoothed_y
+        self.window_switch_last_motion_time = now
+        self.window_switch_direction_hold = 0
+        print("Window switch step")
+
+    def perform_desktop_switch_action(self):
+        if self.hand_result is None:
+            self._desktop_switch_end_session()
+            return
+
+        if not self._desktop_switch_pose_active():
+            self._desktop_switch_end_session()
+            return
+
+        now = time.monotonic()
+        current_x = self._desktop_switch_horizontal_point()
+
+        if self.desktop_switch_last_x is None or self.desktop_switch_smoothed_x is None:
+            self.desktop_switch_last_x = current_x
+            self.desktop_switch_smoothed_x = current_x
+            self.desktop_switch_direction_hold = 0
+            self.desktop_switch_last_motion_time = now
+            return
+
+        self.desktop_switch_smoothed_x = (
+            WINDOW_SWITCH_SMOOTHING_ALPHA * current_x
+            + (1.0 - WINDOW_SWITCH_SMOOTHING_ALPHA) * self.desktop_switch_smoothed_x
+        )
+        delta_x = self.desktop_switch_smoothed_x - self.desktop_switch_last_x
+
+        if abs(delta_x) < WINDOW_SWITCH_HORIZONTAL_THRESHOLD:
+            if now - self.desktop_switch_last_motion_time > WINDOW_SWITCH_SESSION_IDLE_TIMEOUT:
+                self._desktop_switch_end_session()
+            return
+
+        direction_sign = 1 if delta_x > 0 else -1
+        if direction_sign != self.desktop_switch_last_sign:
+            self.desktop_switch_last_sign = direction_sign
+            self.desktop_switch_direction_hold = 1
+            self.desktop_switch_last_x = self.desktop_switch_smoothed_x
+            self.desktop_switch_last_motion_time = now
+            return
+
+        self.desktop_switch_direction_hold += 1
+        if self.desktop_switch_direction_hold < WINDOW_SWITCH_DIRECTION_HOLD_FRAMES:
+            self.desktop_switch_last_x = self.desktop_switch_smoothed_x
+            self.desktop_switch_last_motion_time = now
+            return
+
+        if now - self.desktop_switch_last_action_time < WINDOW_SWITCH_POST_SWITCH_HOLD_SECONDS:
+            self.desktop_switch_last_x = self.desktop_switch_smoothed_x
+            self.desktop_switch_last_motion_time = now
+            self.desktop_switch_direction_hold = 0
+            return
+
+        if now - self.desktop_switch_last_action_time < WINDOW_SWITCH_STEP_COOLDOWN:
+            self.desktop_switch_last_x = self.desktop_switch_smoothed_x
+            self.desktop_switch_last_motion_time = now
+            return
+
+        if direction_sign > 0:
+            pyautogui.hotkey('win', 'ctrl', 'right')
+        else:
+            pyautogui.hotkey('win', 'ctrl', 'left')
+
+        self.desktop_switch_last_action_time = now
+        self.desktop_switch_last_x = self.desktop_switch_smoothed_x
+        self.desktop_switch_last_motion_time = now
+        self.desktop_switch_direction_hold = 0
+        print("Desktop switch step")
 
 
 
@@ -516,17 +917,17 @@ class GestureController:
     def _configure_preview_window(frame_width, frame_height):
         cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.setWindowProperty(PREVIEW_WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
-        pip_width = int(PIP_WIDTH)
-        pip_height = int((frame_height / max(1, frame_width)) * pip_width)
+        screen_w, screen_h = pyautogui.size()
+        pip_width = max(320, int(screen_w * 0.30))
+        pip_height = max(180, int(screen_h * 0.30))
         cv2.resizeWindow(PREVIEW_WINDOW_NAME, pip_width, pip_height)
 
-        screen_w, screen_h = pyautogui.size()
-        pos_x = max(0, int(screen_w - pip_width - PIP_MARGIN))
-        pos_y = max(0, int(screen_h - pip_height - PIP_MARGIN))
+        pos_x = max(0, int((screen_w - pip_width) / 2))
+        pos_y = max(0, int((screen_h - pip_height) / 2))
         cv2.moveWindow(PREVIEW_WINDOW_NAME, pos_x, pos_y)
 
     @staticmethod
-    def _draw_preview_ui(image, is_authorized, raw_is_authorized, face_auth):
+    def _draw_preview_ui(image, is_authorized, raw_is_authorized, face_auth, log_mode=False):
         h, w = image.shape[:2]
         status_text = "AUTHORIZED" if is_authorized else "UNAUTHORIZED"
         if is_authorized and not raw_is_authorized:
@@ -544,7 +945,7 @@ class GestureController:
             f"Status: {status_text}",
             (38, 31),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
+            0.85,
             (245, 245, 245),
             2,
             cv2.LINE_AA,
@@ -554,19 +955,31 @@ class GestureController:
             "EaseAccess | Press Q to quit",
             (12, h - 12),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            .5,
             (220, 220, 220),
             1,
             cv2.LINE_AA,
         )
 
+        if log_mode:
+            cv2.putText(
+                image,
+                "LOG MODE",
+                (w - 94, 31),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (255, 210, 96),
+                1,
+                cv2.LINE_AA,
+            )
+
         if face_auth is not None and (time.time() - face_auth.get_last_match_time() < 10):
             cv2.putText(
                 image,
                 face_auth.get_last_match_result(),
-                (12, min(50, h - 44)),
+                (12, min(60, h - 36)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.42,
+                0.58,
                 (230, 230, 230),
                 1,
                 cv2.LINE_AA,
@@ -574,9 +987,10 @@ class GestureController:
 
         return image
 
-    def __init__(self, disable_face_auth=False, dpi_level=50):
+    def __init__(self, disable_face_auth=False, dpi_level=50, log_preview=False):
         print("Initializing GestureController...")
         self.disable_face_auth = bool(disable_face_auth)
+        self.log_preview_enabled = bool(log_preview)
         Controller.set_dpi_level(dpi_level)
         print(f"Cursor DPI control set to {Controller.dpi_level}/100")
         self.preview_window_visible = False
@@ -685,7 +1099,7 @@ class GestureController:
         handminor = HandRecog(HLabel.MINOR)
 
         try:
-            with mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.7) as hands:
+            with mp_hands.Hands(max_num_hands=2, min_detection_confidence=HAND_DETECTION_CONFIDENCE, min_tracking_confidence=HAND_TRACKING_CONFIDENCE) as hands:
                 print("MediaPipe Hands model loaded")
                 
                 frame_count = 0
@@ -747,7 +1161,7 @@ class GestureController:
                     
                     # Only process gestures if authorized
                     if is_authorized:
-                        if self.preview_window_visible:
+                        if self.preview_window_visible and not self.log_preview_enabled:
                             self._hide_preview_window()
                         if self.desktop_indicator is not None:
                             self.desktop_indicator.show()
@@ -788,6 +1202,8 @@ class GestureController:
                                     hand_states.append(("right", handmajor, major_gesture))
                                 else:
                                     handmajor.update_hand_result(None)
+                                    handmajor.window_switch_points.clear()
+                                    handmajor._window_switch_end_session()
 
                                 if self.hr_minor is not None:
                                     handminor.update_hand_result(self.hr_minor)
@@ -796,6 +1212,8 @@ class GestureController:
                                     hand_states.append(("left", handminor, minor_gesture))
                                 else:
                                     handminor.update_hand_result(None)
+                                    handminor.window_switch_points.clear()
+                                    handminor._window_switch_end_session()
 
                                 control_candidates = [
                                     (GestureController._gesture_priority(gesture), hand_key, tracker, gesture)
@@ -815,6 +1233,10 @@ class GestureController:
 
                                 for hand_key, tracker, _gesture in hand_states:
                                     tracker.perform_presentation_action()
+                                    if tracker.finger == WINDOW_SWITCH_FINGER_PATTERN:
+                                        tracker.perform_window_switch_action()
+                                    elif tracker.finger == Gest.LAST4:
+                                        tracker.perform_desktop_switch_action()
 
                                 
                                 for hand_landmarks in results.multi_hand_landmarks:
@@ -823,6 +1245,10 @@ class GestureController:
                                 Controller.active_hand_key = None
                                 Controller.reset_control_state()
                                 Controller.reset_motion_state()
+                                handmajor.window_switch_points.clear()
+                                handmajor._window_switch_end_session()
+                                handminor.window_switch_points.clear()
+                                handminor._window_switch_end_session()
                                 if VERBOSE_FRAME_LOGS:
                                     print(f"Frame {frame_count}: No hands detected")
                         
@@ -831,6 +1257,10 @@ class GestureController:
                     else:
                         if self.desktop_indicator is not None:
                             self.desktop_indicator.hide()
+                        handmajor.window_switch_points.clear()
+                        handmajor._window_switch_end_session()
+                        handminor.window_switch_points.clear()
+                        handminor._window_switch_end_session()
                         if not self.preview_window_visible:
                             self._show_preview_window()
                         cv2.putText(image, "Authenticating...", 
@@ -841,9 +1271,9 @@ class GestureController:
 
                     if self.preview_window_visible:
                         if self.disable_face_auth:
-                            image = self._draw_preview_ui(image, True, True, None)
+                            image = self._draw_preview_ui(image, True, True, None, log_mode=self.log_preview_enabled)
                         else:
-                            image = self._draw_preview_ui(image, is_authorized, raw_is_authorized, self.face_auth)
+                            image = self._draw_preview_ui(image, is_authorized, raw_is_authorized, self.face_auth, log_mode=self.log_preview_enabled)
                         cv2.imshow(PREVIEW_WINDOW_NAME, image)
                     
                     # Use 'q' instead of Enter for quitting
@@ -866,6 +1296,10 @@ class GestureController:
             if self.desktop_indicator is not None:
                 self.desktop_indicator.hide()
                 self.desktop_indicator.close()
+            handmajor.window_switch_points.clear()
+            handmajor._window_switch_end_session()
+            handminor.window_switch_points.clear()
+            handminor._window_switch_end_session()
             if self.cap:
                 self.cap.release()
             cv2.destroyAllWindows()
@@ -875,11 +1309,12 @@ if __name__ == "__main__":
     print("=== MAIN EXECUTION START ===")
     parser = argparse.ArgumentParser(description="Gesture controller")
     parser.add_argument("-fd", "--face-disabled", action="store_true", help="Disable face auth gate")
+    parser.add_argument("-log", "--log-preview", action="store_true", help="Keep the small hand-landmark preview visible in authorized mode")
     parser.add_argument("--dpi", type=int, default=50, choices=range(1, 101), metavar="1-100", help="Cursor sensitivity / DPI control (1-100)")
     args = parser.parse_args()
 
     try:
-        gc = GestureController(disable_face_auth=args.face_disabled, dpi_level=args.dpi)
+        gc = GestureController(disable_face_auth=args.face_disabled, dpi_level=args.dpi, log_preview=args.log_preview)
         if gc.cap and gc.cap.isOpened():
             gc.start()
         else:

@@ -45,6 +45,8 @@ This document explains how src/gesture_Controller_debug.py works, step by step, 
   - Enables additional frame-by-frame debug logs when set True
 - AUTHORIZATION_HOLD_SECONDS = 3.5
   - Keeps gestures enabled briefly after a temporary auth drop
+- `-log` / `--log-preview`
+  - Keeps the compact hand-landmark preview visible even after authorization and marks it as log mode
 - PREVIEW_WINDOW_NAME = EaseAccess Preview (Press Q to quit)
 - PIP_WIDTH = 420
 - PIP_MARGIN = 24
@@ -109,6 +111,8 @@ For each frame:
 - If minor hand gesture is PINCH_MINOR, minor-hand pinch action path is used
 - Otherwise major hand gesture path is used
 - Presentation actions are checked on both hands each frame
+- Window-switch actions are checked on both hands each frame; the exact three-finger horizontal motion holds Alt and advances tabs as the hand moves left or right
+- The open-hand / all-fingers pose is treated as a hold state with no action
 
 ### 8) Unauthorized behavior
 - Gesture actions are not executed
@@ -199,6 +203,22 @@ Notes:
 Debounce:
 - Each slide action sleeps for about 0.7 seconds to avoid repeated triggers
 
+### Window switch gestures (HandRecog.perform_window_switch_action)
+
+| Gesture logic | Condition | Action |
+|---|---|---|
+| Three-finger horizontal motion | Exactly index, middle, and ring fingers extended; x-position changes even slightly | Hold Alt, press Tab on rightward motion, press Shift+Tab on leftward motion, and release Alt when motion stalls |
+| Three-finger vertical motion | Exactly index, middle, and ring fingers extended; y-position changes even slightly | Minimize all visible windows on downward motion and restore the most recent window on upward motion |
+
+Notes:
+- The gesture is dynamic: each slight horizontal movement can advance the active window while the fingers stay in the 3-finger hold
+- A small smoothing lag is applied so the tab switch feels steady instead of jittery
+- After each tab switch, the controller pauses for about 0.5 second before allowing the next switch
+- Vertical movement is treated as a fast swipe, so it fires with minimal delay once the direction is clear
+- Downward motion uses a direct Win32 window-minimize pass, which is more reliable than the old shortcut-based behavior
+- A short idle timeout releases Alt so the OS does not stay in switcher mode if the hand stops moving
+- Open-hand / all-fingers pose is intentionally inert and does not trigger any action
+
 ## Cursor Motion Behavior
 - Cursor is controlled using landmark point 9
 - Motion delta is smoothed using distance-based gain
@@ -220,6 +240,7 @@ Function mapping:
 ## Current Preview UI Behavior
 - Compact PiP camera window at top-right corner
 - Top-most window so it stays visible
+- When `-log` is enabled, the preview stays visible during authorized tracking so you can inspect the recognized hand-landmark lines
 - Professional overlay with:
   - Status indicator dot
   - Status text (AUTHORIZED / UNAUTHORIZED / AUTHORIZED (HOLD))
