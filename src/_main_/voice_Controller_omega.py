@@ -4,6 +4,10 @@ from datetime import date
 import time
 import webbrowser
 import datetime
+import tkinter as tk
+from tkinter import scrolledtext
+import base64
+import io
 from pynput.keyboard import Key, Controller
 import pyautogui
 import sys
@@ -15,6 +19,7 @@ from os.path import isfile, join, exists
 import wikipedia
 import re
 import json
+import requests
 from difflib import SequenceMatcher
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -79,6 +84,32 @@ r.operation_timeout = 4
 engine = None
 
 
+def _load_local_env():
+    """Load .env values into os.environ (lightweight, no extra dependency)."""
+    candidate_paths = [
+        os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"),
+        os.path.join(os.getcwd(), ".env"),
+    ]
+    env_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+    if not env_path:
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and value and key not in os.environ:
+                    os.environ[key] = value
+    except Exception as e:
+        print(f"Could not load .env: {e}")
+
+
 def _init_tts_engine():
     """Initialize TTS in the same thread that will speak (important on Windows)."""
     try:
@@ -100,6 +131,7 @@ def _init_tts_engine():
     return local_engine
 
 voice_indicator = VoiceStateIndicator() if VoiceStateIndicator is not None else None
+_load_local_env()
 
 
 def _voice_show_listening():
@@ -216,6 +248,15 @@ TTS_QUEUE_MAXSIZE = 256
 command_queue = Queue(maxsize=COMMAND_QUEUE_MAXSIZE)
 tts_queue = Queue(maxsize=TTS_QUEUE_MAXSIZE)
 shutdown_event = Event()
+last_note_file_path = None
+
+NOTEBOOK_FILENAME = "Notesbyomega.txt"
+GEMINI_SUMMARY_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-latest",
+]
+_gemini_model_cache = {"models": None, "at": 0.0}
 
 _raw_print = builtins.print
 
@@ -487,6 +528,19 @@ def normalize_app_query(text):
     cleaned = normalize_voice_text(text)
     cleaned = re.sub(
         r"\b(open|launch|start|run|app|application|program|command|please|the)\b",
+        " ",
+        cleaned
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def normalize_window_action_query(text):
+    if not text:
+        return ""
+    cleaned = normalize_voice_text(text)
+    cleaned = re.sub(
+        r"\b(omega|maximize|maximise|minimize|minimise|window|this|current|please|the)\b",
         " ",
         cleaned
     )
@@ -2663,18 +2717,495 @@ def reply(audio):
     print(f"omega: {audio}")
 
 
+def _desktop_notes_file():
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    return os.path.join(desktop, NOTEBOOK_FILENAME)
+
+
+def _ensure_notes_file():
+    note_path = _desktop_notes_file()
+    desktop_dir = os.path.dirname(note_path)
+    if not os.path.exists(desktop_dir):
+        os.makedirs(desktop_dir, exist_ok=True)
+    if not os.path.exists(note_path):
+        with open(note_path, "w", encoding="utf-8") as f:
+            f.write("")
+    return note_path
+
+
+def _extract_note_tag(text: str):
+    tags = ("medicine", "work", "personal")
+    for tag in tags:
+        if f"tag as {tag}" in text:
+            return tag
+    return None
+
+
+def _show_status_popup(title: str, message: str):
+    try:
+        win32api.MessageBox(0, str(message), str(title), 0x00000040)
+    except Exception:
+        pass
+
+
+def _extract_note_body(text: str, mode="take"):
+    cleaned = text
+    for token in ("omega", "please"):
+        cleaned = cleaned.replace(token, " ")
+    if mode == "take":
+        cleaned = re.sub(r"\b(take note|save note|note down|create note)\b", "", cleaned).strip()
+    else:
+        cleaned = re.sub(r"\b(append to last note|append note|add to note)\b", "", cleaned).strip()
+    cleaned = re.sub(r"\b(tag as medicine|tag as work|tag as personal)\b", "", cleaned).strip()
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _write_note(note_text: str, tag: str = None, is_append: bool = False):
+    global last_note_file_path
+    if not note_text:
+        return False
+    note_path = _ensure_notes_file()
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tag_text = f"[{tag.upper()}] " if tag else ""
+    line = f"{timestamp} | {tag_text}{note_text}\n"
+    mode = "a" if is_append else "a"
+    with open(note_path, mode, encoding="utf-8") as f:
+        f.write(line)
+    last_note_file_path = note_path
+    _show_status_popup("Omega Notes", f"Saved successfully to:\n{note_path}")
+    return True
+
+
+def _read_latest_note():
+    note_path = _ensure_notes_file()
+    with open(note_path, "r", encoding="utf-8") as f:
+        lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+    if not lines:
+        reply("Your notes file is empty.")
+        return
+    reply(f"Latest note is: {lines[-1]}")
+
+
+def _normalize_text_line(line: str):
+    line = re.sub(r"\s+", " ", (line or "")).strip()
+    return re.sub(r"[^\w\s.,:;!?()\-/%]", "", line)
+
+
+def _is_noise_line(line: str):
+    if not line:
+        return True
+    low = line.lower().strip()
+    if len(low) < 18:
+        return True
+    if re.fullmatch(r"[\W\d_]+", low):
+        return True
+    noise_terms = [
+        "home", "menu", "sign in", "log in", "search", "subscribe", "share", "cookie",
+        "privacy policy", "terms", "accept", "next", "previous", "skip", "navigation",
+        "advertisement", "sponsored", "read more", "click here", "download app"
+    ]
+    return any(low == term or low.startswith(f"{term} ") for term in noise_terms)
+
+
+def _dedupe_near_lines(lines):
+    kept = []
+    for line in lines:
+        if not kept:
+            kept.append(line)
+            continue
+        is_dup = False
+        for prev in kept[-8:]:
+            ratio = SequenceMatcher(None, prev.lower(), line.lower()).ratio()
+            if ratio >= 0.9:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(line)
+    return kept
+
+
+def _screen_text_for_summary():
+    screenshot = ImageGrab.grab()
+    img = np.array(screenshot)
+    h, w = img.shape[:2]
+    # Ignore top nav and bottom status bars: capture main reading area.
+    top = int(h * 0.12)
+    bottom = int(h * 0.92)
+    left = int(w * 0.05)
+    right = int(w * 0.95)
+    roi = img[top:bottom, left:right]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 7, 50, 50)
+    enlarged = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    enhanced = cv2.adaptiveThreshold(
+        enlarged, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 15
+    )
+
+    ocr = pytesseract.image_to_data(enhanced, output_type=pytesseract.Output.DICT, config="--oem 3 --psm 6")
+    line_buckets = {}
+    n = len(ocr.get("text", []))
+    for idx in range(n):
+        word = (ocr["text"][idx] or "").strip()
+        conf_raw = ocr.get("conf", ["-1"] * n)[idx]
+        try:
+            conf = float(conf_raw)
+        except Exception:
+            conf = -1
+        if not word or conf < 35:
+            continue
+        key = (
+            ocr.get("block_num", [0] * n)[idx],
+            ocr.get("par_num", [0] * n)[idx],
+            ocr.get("line_num", [0] * n)[idx],
+        )
+        line_buckets.setdefault(key, []).append(word)
+
+    lines = []
+    for _, words in sorted(line_buckets.items(), key=lambda x: x[0]):
+        line = _normalize_text_line(" ".join(words))
+        if not _is_noise_line(line):
+            lines.append(line)
+
+    lines = _dedupe_near_lines(lines)
+    return "\n".join(lines).strip()
+
+
+def _capture_screen_jpeg_base64():
+    screenshot = ImageGrab.grab()
+    rgb = screenshot.convert("RGB")
+    buffer = io.BytesIO()
+    rgb.save(buffer, format="JPEG", quality=80, optimize=True)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def _extract_gemini_text(data: dict):
+    candidates = data.get("candidates", []) if isinstance(data, dict) else []
+    if not candidates:
+        return None
+    c0 = candidates[0]
+    finish_reason = str(c0.get("finishReason", "")).upper()
+    if finish_reason and finish_reason not in ("STOP", "MAX_TOKENS"):
+        return None
+    parts = c0.get("content", {}).get("parts", [])
+    merged_text = " ".join(
+        p.get("text", "").strip() for p in parts if isinstance(p, dict) and p.get("text")
+    ).strip()
+    return merged_text or None
+
+
+def _gemini_generate(payload: dict, api_key: str):
+    def _list_available_generate_models():
+        now = time.time()
+        if _gemini_model_cache["models"] and (now - _gemini_model_cache["at"]) < 600:
+            return _gemini_model_cache["models"]
+        discovered = []
+        for api_ver in ("v1beta", "v1"):
+            url = f"https://generativelanguage.googleapis.com/{api_ver}/models?key={api_key}"
+            try:
+                resp = requests.get(url, timeout=30)
+                data = resp.json() if resp.content else {}
+                for item in data.get("models", []):
+                    methods = item.get("supportedGenerationMethods", []) or []
+                    if "generateContent" in methods:
+                        name = item.get("name", "")
+                        if name.startswith("models/"):
+                            name = name.split("/", 1)[1]
+                        if name:
+                            discovered.append(name)
+            except Exception:
+                continue
+        discovered = sorted(set(discovered), key=lambda n: (0 if "flash" in n.lower() else 1, n))
+        _gemini_model_cache["models"] = discovered
+        _gemini_model_cache["at"] = now
+        return discovered
+
+    last_error = None
+    candidate_models = _list_available_generate_models() or GEMINI_SUMMARY_MODELS
+    for api_ver in ("v1beta", "v1"):
+        for model_name in candidate_models:
+            url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model_name}:generateContent?key={api_key}"
+            try:
+                resp = requests.post(url, json=payload, timeout=60)
+                data = resp.json() if resp.content else {}
+                txt = _extract_gemini_text(data)
+                if resp.ok and txt:
+                    return txt, None
+                if isinstance(data, dict) and data.get("error"):
+                    last_error = f"{api_ver}/{model_name}: {data['error'].get('message', 'Gemini error')}"
+                else:
+                    last_error = f"{api_ver}/{model_name}: Gemini HTTP {resp.status_code}"
+            except Exception as e:
+                last_error = f"{api_ver}/{model_name}: {str(e)}"
+    return None, last_error or "No Gemini model succeeded"
+
+
+def _summarize_screen_image_with_gemini():
+    api_key = (
+        os.getenv("GEMINI_API_KEY", "").strip()
+        or os.getenv("GOOGLE_API_KEY", "").strip()
+    )
+    if not api_key:
+        return None, "Missing GEMINI_API_KEY"
+
+    img_b64 = _capture_screen_jpeg_base64()
+    prompt = (
+        "You are summarizing the MAIN article/document content visible in this screenshot.\n"
+        "Ignore headers, sidebars, menus, ads, cookie notices, and repeated UI text.\n"
+        "Write a natural, readable summary focused on key ideas and important facts.\n"
+        "Output exactly one paragraph, around 100-140 words."
+    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.2, "topP": 0.9, "maxOutputTokens": 320}
+    }
+    return _gemini_generate(payload, api_key)
+
+
+def _summarize_with_gemini(text: str):
+    api_key = (
+        os.getenv("GEMINI_API_KEY", "").strip()
+        or os.getenv("GOOGLE_API_KEY", "").strip()
+    )
+    if not api_key:
+        return None, "Missing GEMINI_API_KEY"
+
+    clean_text = re.sub(r"\s+", " ", text).strip()
+    if len(clean_text) < 120:
+        return None, "Not enough content for summary"
+
+    words = clean_text.split()
+    if len(words) > 1800:
+        clean_text = " ".join(words[:1800])
+
+    prompt = (
+        "You are an expert readability-focused summarizer.\n"
+        "Rules:\n"
+        "1) Focus on key ideas and conclusions.\n"
+        "2) Ignore navigation/UI/menu/footer/cookie-like text if present.\n"
+        "3) Remove repeated or noisy content.\n"
+        "4) Write natural, coherent English for a human reader.\n"
+        "5) Keep important facts, numbers, and named entities.\n"
+        "6) Output one concise paragraph (90-140 words).\n\n"
+        f"Source text:\n{clean_text}"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "topP": 0.9,
+            "maxOutputTokens": 350
+        }
+    }
+    return _gemini_generate(payload, api_key)
+
+
+def _simple_fallback_summary(text: str, mode: str):
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 25]
+    if len(sentences) < 2:
+        return "I could not extract enough readable text from screen."
+    try:
+        vectorizer = TfidfVectorizer(stop_words="english")
+        matrix = vectorizer.fit_transform(sentences)
+        scores = np.asarray(matrix.sum(axis=1)).ravel()
+        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        pick = sorted(ranked[:min(4, len(sentences))])
+        return " ".join(sentences[i] for i in pick)
+    except Exception:
+        return " ".join(sentences[:3])
+
+
+def _show_summary_popup(summary_text: str):
+    try:
+        root = tk.Tk()
+        root.title("Omega Summary")
+        root.attributes("-topmost", True)
+        root.geometry("680x420+120+80")
+        root.configure(bg="#101216")
+        title = tk.Label(
+            root,
+            text="Summary",
+            font=("Segoe UI", 14, "bold"),
+            fg="white",
+            bg="#101216",
+            anchor="w"
+        )
+        title.pack(fill="x", padx=12, pady=(10, 6))
+        box = scrolledtext.ScrolledText(
+            root,
+            wrap=tk.WORD,
+            font=("Segoe UI", 11),
+            bg="#171a21",
+            fg="#e9eef7",
+            insertbackground="white"
+        )
+        box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        box.insert(tk.END, summary_text)
+        box.configure(state="disabled")
+        root.mainloop()
+    except Exception as e:
+        print(f"Summary popup error: {e}")
+
+
+def handle_screen_summary(cmd: str):
+    summary, api_error = _summarize_screen_image_with_gemini()
+    if summary:
+        _show_summary_popup(summary)
+        reply(summary)
+        return
+
+    text = _screen_text_for_summary()
+    if len(text) < 40:
+        reply("I could not read enough text from the screen to summarize.")
+        if api_error:
+            print(f"Summary API fallback used: {api_error}")
+        return
+    summary, api_error = _summarize_with_gemini(text)
+    if summary:
+        _show_summary_popup(summary)
+        reply(summary)
+        return
+    fallback_summary = _simple_fallback_summary(text, "short")
+    _show_summary_popup(fallback_summary)
+    reply("I could not generate cloud summary, so I used local summarization.")
+    reply(fallback_summary)
+    if api_error:
+        print(f"Summary API fallback used: {api_error}")
+
+
+def _set_window_always_on_top(title_part: str):
+    for w in gw.getAllWindows():
+        if w.title and title_part.lower() in w.title.lower():
+            try:
+                hwnd = w._hWnd
+                win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+                return True
+            except Exception:
+                return False
+    return False
+
+
+def handle_search_side_by_side(query: str):
+    if not query:
+        reply("Please tell me what to search.")
+        return
+    url = "https://google.com/search?q=" + query.replace(" ", "+")
+    subprocess.Popen(["cmd", "/c", "start", "chrome", url], shell=False)
+    time.sleep(1.5)
+    pyautogui.hotkey("win", "right")
+    _set_window_always_on_top("chrome")
+    reply("Opened search in Chrome side by side.")
+
+
+def handle_minimize_active_window():
+    try:
+        active_win = gw.getActiveWindow()
+        if active_win and getattr(active_win, "_hWnd", None):
+            hwnd = active_win._hWnd
+            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+            reply("Minimized the active window.")
+            return
+    except Exception:
+        pass
+    try:
+        pyautogui.hotkey("alt", "space")
+        time.sleep(0.08)
+        pyautogui.press("n")
+        reply("Minimized the active window.")
+        return
+    except Exception:
+        pass
+    pyautogui.hotkey("win", "m")
+    reply("Tried to minimize the active window.")
+
+
+def handle_maximize_active_window():
+    try:
+        active_win = gw.getActiveWindow()
+        if active_win and getattr(active_win, "_hWnd", None):
+            hwnd = active_win._hWnd
+            win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+            reply("Maximized the active window.")
+            return
+    except Exception:
+        pass
+    try:
+        pyautogui.hotkey("alt", "space")
+        time.sleep(0.08)
+        pyautogui.press("x")
+        reply("Maximized the active window.")
+        return
+    except Exception:
+        pass
+    pyautogui.hotkey("win", "up")
+    reply("Tried to maximize the active window.")
+
+
+def handle_maximize_window_by_name(app_name: str):
+    target = normalize_window_action_query(app_name)
+    if not target:
+        handle_maximize_active_window()
+        return
+
+    terms = [target]
+    for canonical, aliases in APP_ALIAS_GROUPS.items():
+        if target == canonical or target in aliases:
+            terms.extend([canonical] + aliases)
+    terms = [t.lower().strip() for t in terms if t and len(t) > 1]
+
+    matched_titles = []
+    try:
+        for title in gw.getAllTitles():
+            t = (title or "").strip()
+            if not t:
+                continue
+            low = t.lower()
+            if any(term in low for term in terms):
+                matched_titles.append(t)
+    except Exception:
+        matched_titles = []
+
+    if not matched_titles:
+        reply(f"I could not find an open window for {target}.")
+        return
+
+    for title in matched_titles:
+        try:
+            wins = gw.getWindowsWithTitle(title)
+            if not wins:
+                continue
+            w = wins[0]
+            hwnd = getattr(w, "_hWnd", None)
+            if hwnd:
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+                win32gui.SetForegroundWindow(hwnd)
+                reply(f"Maximized {target}.")
+                return
+        except Exception:
+            continue
+
+    reply(f"I found {target}, but could not maximize that window.")
+
+
 def handle_scroll_command(full_cmd: str):
     """Perform a smooth wheel-scroll at the current cursor position."""
     cmd = normalize_voice_text(full_cmd)
     is_up = "up" in cmd
-    wheel_delta = 50 if is_up else -50
+    wheel_delta = 220 if is_up else -220
 
     try:
         # Wheel event is delivered to the control under current cursor.
         win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, wheel_delta, 0)
     except Exception:
         # Fallback for environments where low-level wheel event is blocked.
-        pyautogui.scroll(50 if is_up else -50)
+        pyautogui.scroll(220 if is_up else -220)
 
     reply("Scrolled up." if is_up else "Scrolled down.")
 
@@ -2915,55 +3446,10 @@ def handle_date_query():
     reply(today.strftime("Today's date is %B %d, %Y"))
 
 def handle_search(query):
-    """
-    Launch a web search, and remember if we came from a presentation
-    so we can return on demand (or automatically if AUTO_RETURN_AFTER_SEARCH=True).
-    """
-    global last_context
+    """Launch a web search in Chrome side-by-side mode."""
     if query:
         reply(f"Searching for {query}")
-        try:
-            import pygetwindow as gw
-            import time
-            import webbrowser
-
-            # Detect current active window (if possible) to remember context
-            try:
-                active_win = gw.getActiveWindow()
-                active_title = active_win.title.lower() if active_win and active_win.title else ""
-                if "powerpoint" in active_title or "slide show" in active_title or "presentation" in active_title:
-                    last_context = "presentation"
-                    # ✅ Minimize PowerPoint temporarily
-                    try:
-                        active_win.minimize()
-                        print("🪄 Minimized PowerPoint before search to keep Chrome visible.")
-                    except Exception as e:
-                        print(f"Could not minimize PowerPoint: {e}")
-                else:
-                    last_context = None
-            except Exception as _:
-                last_context = None
-
-            # Perform the search
-            url = "https://google.com/search?q=" + query.replace(" ", "+")
-            webbrowser.get().open(url)
-            reply("Here are the search results I found")
-
-            # Optional: automatic return if explicitly enabled
-            if AUTO_RETURN_AFTER_SEARCH and last_context == "presentation":
-                time.sleep(2)
-                pyautogui.press("esc")
-
-
-                success = focus_powerpoint()
-                if success:
-                    reply("Returned to the presentation.")
-                else:
-                    reply("I couldn't return to the presentation automatically.")
-
-        except Exception as e:
-            print("handle_search error:", e)
-            reply("Please check your internet connection")
+        handle_search_side_by_side(query)
     else:
         reply("What would you like me to search for?")
         temp_audio = record_audio()
@@ -3818,7 +4304,96 @@ def respond(voice_data):
             return
 
     if re.match(r"^scroll(?:\s|$)", pv):
+        if "slow" in pv:
+            is_up = "up" in pv
+            for _ in range(6):
+                try:
+                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, 25 if is_up else -25, 0)
+                except Exception:
+                    pyautogui.scroll(25 if is_up else -25)
+                time.sleep(0.08)
+            reply("Slow scroll done.")
+            return
         handle_scroll_command(pv)
+        return
+
+    if any(x in pv for x in ("take note", "save note", "note down", "create note")):
+        tag = _extract_note_tag(pv)
+        note = _extract_note_body(pv, mode="take")
+        if note and _write_note(note, tag=tag, is_append=False):
+            reply("Saved note to Desktop file Notesbyomega.")
+        else:
+            reply("Please say the note text after take note.")
+        return
+
+    if any(x in pv for x in ("append to last note", "append note", "add to note")):
+        tag = _extract_note_tag(pv)
+        note = _extract_note_body(pv, mode="append")
+        if note and _write_note(note, tag=tag, is_append=True):
+            reply("Appended to Notesbyomega on Desktop.")
+        else:
+            reply("Please tell me what to append.")
+        return
+
+    if any(x in pv for x in ("read my latest note", "read latest note", "latest note")):
+        _read_latest_note()
+        return
+
+    if any(x in pv for x in (
+        "summarize this page", "summarize page", "summary of this page",
+        "summarise this page", "summarise page", "summary this page"
+    )):
+        handle_screen_summary(pv)
+        return
+
+    if any(x in pv for x in ("search this", "search side by side")):
+        q = re.sub(r"\b(search this|search side by side|search)\b", "", pv).strip()
+        if not q:
+            reply("What should I search side by side?")
+            q = normalize_voice_text(record_audio() or "").strip()
+        handle_search_side_by_side(q)
+        return
+
+    if any(x in pv for x in (
+        "minimize window", "minimize this window", "minimize current window",
+        "minimise window", "minimise this window", "minimise current window"
+    )):
+        handle_minimize_active_window()
+        return
+
+    if (
+        pv.startswith("maximize")
+        or pv.startswith("maximise")
+        or any(x in pv for x in (
+            "maximize window", "maximize this window", "maximize current window",
+            "maximise window", "maximise this window", "maximise current window"
+        ))
+    ):
+        target_app = normalize_window_action_query(pv)
+        if target_app:
+            handle_maximize_window_by_name(target_app)
+        else:
+            handle_maximize_active_window()
+        return
+
+    if "next field" in pv:
+        pyautogui.press("tab")
+        reply("Moved to next field.")
+        return
+
+    if "click top right" in pv or "click top-right" in pv:
+        sw, sh = pyautogui.size()
+        pyautogui.click(sw - 30, 30)
+        reply("Clicked top right area.")
+        return
+
+    if pv in ("back", "go back"):
+        pyautogui.hotkey("alt", "left")
+        reply("Went back.")
+        return
+
+    if "confirm before clicking destructive buttons" in pv:
+        reply("Safety mode acknowledged. I will ask confirmation for close, delete, and exit actions.")
         return
 
     if is_thank_you_exit_command(pv):
