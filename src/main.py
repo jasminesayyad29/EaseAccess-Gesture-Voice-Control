@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 
@@ -176,17 +177,28 @@ def main():
     print("[MAIN] Press Ctrl+C in this terminal to stop both.")
 
     hide_window = args.auto
-    voice_proc = _start_controller(voice_script, "voice controller", run_cwd=base_dir, hide_window=hide_window)
-    # Small stagger helps camera and audio init avoid startup collisions.
-    time.sleep(1.2)
     gesture_extra_args = ["-fd"] if args.face_disabled else []
-    gesture_proc = _start_controller(
-        gesture_script,
-        "gesture controller",
-        gesture_extra_args,
-        run_cwd=base_dir,
-        hide_window=hide_window,
-    )
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="controller-launch") as launcher:
+        voice_future = launcher.submit(
+            _start_controller,
+            voice_script,
+            "voice controller",
+            None,
+            base_dir,
+            hide_window,
+        )
+        gesture_future = launcher.submit(
+            _start_controller,
+            gesture_script,
+            "gesture controller",
+            gesture_extra_args,
+            base_dir,
+            hide_window,
+        )
+
+        voice_proc = voice_future.result()
+        gesture_proc = gesture_future.result()
 
     should_restart_without_face_auth = False
 

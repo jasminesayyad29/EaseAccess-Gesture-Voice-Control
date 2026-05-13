@@ -5,6 +5,7 @@ import math
 import argparse
 import sys
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
 from enum import IntEnum
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
@@ -1099,8 +1100,31 @@ class GestureController:
         handminor = HandRecog(HLabel.MINOR)
 
         try:
-            with mp_hands.Hands(max_num_hands=2, min_detection_confidence=HAND_DETECTION_CONFIDENCE, min_tracking_confidence=HAND_TRACKING_CONFIDENCE) as hands:
+            with mp_hands.Hands(max_num_hands=2, min_detection_confidence=HAND_DETECTION_CONFIDENCE, min_tracking_confidence=HAND_TRACKING_CONFIDENCE) as hands, ThreadPoolExecutor(max_workers=2, thread_name_prefix="gesture-frame") as frame_executor:
                 print("MediaPipe Hands model loaded")
+
+                def _run_face_auth(frame):
+                    if self.disable_face_auth:
+                        return False, None, True, None
+
+                    try:
+                        face_detected, faces = self.face_auth.authenticate_frame(frame)
+                        raw_is_authorized = self.face_auth.get_auth_status()
+                        return face_detected, faces, raw_is_authorized, None
+                    except Exception as exc:
+                        return None, None, None, exc
+
+                def _run_hand_processing(frame):
+                    try:
+                        mirrored_for_processing = cv2.flip(frame, 1)
+                        image_rgb = cv2.cvtColor(mirrored_for_processing, cv2.COLOR_BGR2RGB)
+                        image_rgb.flags.writeable = False
+                        results = hands.process(image_rgb)
+                        image_rgb.flags.writeable = True
+                        processed_image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+                        return results, processed_image, None
+                    except Exception as exc:
+                        return None, None, exc
                 
                 frame_count = 0
                 
@@ -1114,50 +1138,54 @@ class GestureController:
 
                     if VERBOSE_FRAME_LOGS and frame_count % 30 == 0:
                         print(f"Frame {frame_count}: Processing...")
+
+                    face_future = frame_executor.submit(_run_face_auth, image.copy())
+                    hand_future = frame_executor.submit(_run_hand_processing, image.copy())
                     
-                    # Face authentication
-                    if self.disable_face_auth:
-                        is_authorized = True
-                        raw_is_authorized = True
+
+                    face_detected, faces, raw_is_authorized, face_error = face_future.result()
+
+                    if face_error is not None:
+                        self.auth_error_count += 1
+                        print(f"Face auth error ({self.auth_error_count}/{self.max_auth_errors}): {face_error}")
+                        if self.auth_error_count >= self.max_auth_errors:
+                            raise RuntimeError("face auth runtime failed repeatedly") from face_error
+                        # Do not instantly cut off gestures due to a transient auth exception.
+                        is_authorized = (time.time() - self.last_authorized_time) <= AUTHORIZATION_HOLD_SECONDS
+                        raw_is_authorized = is_authorized
+                        self.prev_raw_authorized = raw_is_authorized
                     else:
-                        try:
-                            face_detected, faces = self.face_auth.authenticate_frame(image)
-                            raw_is_authorized = self.face_auth.get_auth_status()
-                            now = time.time()
+                        now = time.time()
 
-                            # Keep gestures enabled for a short grace window to prevent frame-level auth flicker.
-                            if raw_is_authorized:
-                                self.last_authorized_time = now
-                                self.auth_gate_authorized = True
-                            elif now - self.last_authorized_time <= AUTHORIZATION_HOLD_SECONDS:
-                                self.auth_gate_authorized = True
-                            else:
-                                self.auth_gate_authorized = False
+                        # Keep gestures enabled for a short grace window to prevent frame-level auth flicker.
+                        if raw_is_authorized:
+                            self.last_authorized_time = now
+                            self.auth_gate_authorized = True
+                        elif now - self.last_authorized_time <= AUTHORIZATION_HOLD_SECONDS:
+                            self.auth_gate_authorized = True
+                        else:
+                            self.auth_gate_authorized = False
 
-                            is_authorized = self.auth_gate_authorized
-                            self.auth_error_count = 0
+                        is_authorized = self.auth_gate_authorized
+                        self.auth_error_count = 0
 
-                            if raw_is_authorized and not self.prev_raw_authorized:
-                                if self.desktop_indicator is not None and not self.minimize_after_auth_done:
-                                    self.desktop_indicator.minimize_all_windows()
-                                    self.minimize_after_auth_done = True
-                            self.prev_raw_authorized = raw_is_authorized
-                            
-                            # Draw face bounding box and status
-                            if face_detected:
-                                x,y,w,h = max(faces, key=lambda r: r[2]*r[3])
-                                color = (0, 255, 0) if raw_is_authorized else (0, 0, 255)
-                                cv2.rectangle(image, (x,y), (x+w, y+h), color, 2)
-                            
-                        except Exception as e:
-                            self.auth_error_count += 1
-                            print(f"Face auth error ({self.auth_error_count}/{self.max_auth_errors}): {e}")
-                            if self.auth_error_count >= self.max_auth_errors:
-                                raise RuntimeError("face auth runtime failed repeatedly") from e
-                            # Do not instantly cut off gestures due to a transient auth exception.
-                            is_authorized = (time.time() - self.last_authorized_time) <= AUTHORIZATION_HOLD_SECONDS
-                            raw_is_authorized = is_authorized
-                            self.prev_raw_authorized = raw_is_authorized
+                        if raw_is_authorized and not self.prev_raw_authorized:
+                            if self.desktop_indicator is not None and not self.minimize_after_auth_done:
+                                self.desktop_indicator.minimize_all_windows()
+                                self.minimize_after_auth_done = True
+                        self.prev_raw_authorized = raw_is_authorized
+
+                    results, processed_image, hand_error = hand_future.result()
+
+                    if hand_error is not None:
+                        print(f"Gesture processing error: {hand_error}")
+
+                    display_image = processed_image if (is_authorized and processed_image is not None) else image
+                    if face_detected and faces is not None:
+                        x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
+                        color = (0, 255, 0) if raw_is_authorized else (0, 0, 255)
+                        cv2.rectangle(display_image, (x, y), (x + w, y + h), color, 2)
+                    image = display_image
                     
                     # Only process gestures if authorized
                     if is_authorized:
@@ -1166,16 +1194,7 @@ class GestureController:
                         if self.desktop_indicator is not None:
                             self.desktop_indicator.show()
                         try:
-                            # Keep gesture behavior unchanged by processing a mirrored frame,
-                            # then flip back only for display to avoid mirrored preview.
-                            mirrored_for_processing = cv2.flip(image, 1)
-                            image_rgb = cv2.cvtColor(mirrored_for_processing, cv2.COLOR_BGR2RGB)
-                            image_rgb.flags.writeable = False
-                            results = hands.process(image_rgb)
-                            image_rgb.flags.writeable = True
-                            image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-
-                            if VERBOSE_FRAME_LOGS and results.multi_hand_landmarks:
+                            if results is not None and results.multi_hand_landmarks:
                                 print(f"=== Frame {frame_count} MediaPipe Results ===")
                                 print(f"Hands detected: {len(results.multi_hand_landmarks)}")
                                 
@@ -1189,7 +1208,7 @@ class GestureController:
                             elif VERBOSE_FRAME_LOGS:
                                 print(f"Frame {frame_count}: No hands detected")
 
-                            if results.multi_hand_landmarks:
+                            if results is not None and results.multi_hand_landmarks:
                                 if VERBOSE_FRAME_LOGS:
                                     print(f"Frame {frame_count}: Hands detected")
                                 self.classify_hands(results)

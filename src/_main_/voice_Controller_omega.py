@@ -338,6 +338,25 @@ def _command_worker():
             print(f"Command worker error: {e}")
 
 
+def _audio_capture_worker():
+    while not shutdown_event.is_set():
+        try:
+            voice_data = record_audio()
+            if voice_data:
+                reply(f"I heard {voice_data}")
+                if _should_allow_command(voice_data):
+                    _enqueue_latest(command_queue, voice_data)
+            time.sleep(0.02)
+        except SystemExit:
+            shutdown_event.set()
+        except KeyboardInterrupt:
+            reply("Interrupted by user")
+            shutdown_event.set()
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            time.sleep(1)
+
+
 def _normalize_app_key(value: str) -> str:
     if not value:
         return ""
@@ -3971,35 +3990,19 @@ if __name__ == "__main__":
 
     tts_thread = Thread(target=_tts_worker, daemon=True)
     cmd_thread = Thread(target=_command_worker, daemon=True)
+    audio_thread = Thread(target=_audio_capture_worker, daemon=True)
     tts_thread.start()
     cmd_thread.start()
+    audio_thread.start()
 
     wish()
 
     while not shutdown_event.is_set():
-        try:
-            # Take input from voice only
-            voice_data = record_audio()
-
-            # Process voice_data if we have input
-            if voice_data:
-                reply(f"I heard {voice_data}")
-                if _should_allow_command(voice_data):
-                    _enqueue_latest(command_queue, voice_data)
-                    
-            time.sleep(0.02)
-                    
-        except SystemExit:
-            shutdown_event.set()
-        except KeyboardInterrupt:
-            reply("Interrupted by user")
-            shutdown_event.set()
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            time.sleep(1)  # Prevent rapid error looping
+        time.sleep(0.1)
 
     _enqueue_latest(command_queue, None)
     _enqueue_latest(tts_queue, None)
+    audio_thread.join(timeout=1.2)
     cmd_thread.join(timeout=1.2)
     tts_thread.join(timeout=1.2)
     _voice_close()
