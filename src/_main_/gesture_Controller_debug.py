@@ -82,6 +82,9 @@ WINDOW_SWITCH_STEP_COOLDOWN = 0.05
 WINDOW_SWITCH_POST_SWITCH_HOLD_SECONDS = 0.5
 WINDOW_SWITCH_SESSION_IDLE_TIMEOUT = 0.85
 WINDOW_SWITCH_FINGER_PATTERN = 14
+DESKTOP_SWITCH_POSE_HOLD_FRAMES = 4
+DESKTOP_SWITCH_STEP_COOLDOWN = 0.18
+DESKTOP_SWITCH_POST_SWITCH_HOLD_SECONDS = 0.9
 HAND_DETECTION_CONFIDENCE = 0.7
 HAND_TRACKING_CONFIDENCE = 0.8
 FINGER_EXTENSION_ANGLE_DEGREES = 160.0
@@ -145,6 +148,7 @@ class HandRecog:
         self.desktop_switch_direction_hold = 0
         self.desktop_switch_last_motion_time = 0.0
         self.desktop_switch_last_action_time = 0.0
+        self.desktop_switch_pose_frames = 0
     
     def update_hand_result(self, hand_result):
         self.hand_result = hand_result
@@ -198,9 +202,7 @@ class HandRecog:
         return angle >= FINGER_EXTENSION_ANGLE_DEGREES and tip_distance >= (pip_distance * FINGER_EXTENSION_WRIST_RATIO)
 
     def _window_switch_begin_session(self, now, axis, sign):
-        if not self.window_switch_alt_held:
-            pyautogui.keyDown('alt')
-            self.window_switch_alt_held = True
+        self.window_switch_alt_held = True
 
         self.window_switch_last_axis = axis
         self.window_switch_last_sign = sign
@@ -265,6 +267,7 @@ class HandRecog:
         self.desktop_switch_direction_hold = 0
         self.desktop_switch_last_motion_time = 0.0
         self.desktop_switch_last_action_time = 0.0
+        self.desktop_switch_pose_frames = 0
 
     def _window_switch_minimize_all_windows(self):
         try:
@@ -545,11 +548,9 @@ class HandRecog:
             return
 
         if direction_sign > 0:
-            pyautogui.press('tab')
+            pyautogui.hotkey('alt', 'tab')
         else:
-            pyautogui.keyDown('shift')
-            pyautogui.press('tab')
-            pyautogui.keyUp('shift')
+            pyautogui.hotkey('alt', 'shift', 'tab')
 
         self.last_window_switch_action_time = now
         self.window_switch_last_x = self.window_switch_smoothed_x
@@ -565,6 +566,11 @@ class HandRecog:
 
         if not self._desktop_switch_pose_active():
             self._desktop_switch_end_session()
+            return
+
+        self.desktop_switch_pose_frames += 1
+        if self.desktop_switch_pose_frames < DESKTOP_SWITCH_POSE_HOLD_FRAMES:
+            self.desktop_switch_last_motion_time = time.monotonic()
             return
 
         now = time.monotonic()
@@ -602,13 +608,13 @@ class HandRecog:
             self.desktop_switch_last_motion_time = now
             return
 
-        if now - self.desktop_switch_last_action_time < WINDOW_SWITCH_POST_SWITCH_HOLD_SECONDS:
+        if now - self.desktop_switch_last_action_time < DESKTOP_SWITCH_POST_SWITCH_HOLD_SECONDS:
             self.desktop_switch_last_x = self.desktop_switch_smoothed_x
             self.desktop_switch_last_motion_time = now
             self.desktop_switch_direction_hold = 0
             return
 
-        if now - self.desktop_switch_last_action_time < WINDOW_SWITCH_STEP_COOLDOWN:
+        if now - self.desktop_switch_last_action_time < DESKTOP_SWITCH_STEP_COOLDOWN:
             self.desktop_switch_last_x = self.desktop_switch_smoothed_x
             self.desktop_switch_last_motion_time = now
             return
