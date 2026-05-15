@@ -45,11 +45,15 @@ import win32api
 import pythoncom
 import pychrome
 from queue import Queue, Empty, Full
-from threading import Thread, Event
+from threading import Thread, Event, current_thread
 try:
     from voice_indicator import VoiceStateIndicator
 except Exception:
     VoiceStateIndicator = None
+try:
+    from enhanced_voice_recognizer import EnhancedVoiceRecognizer
+except Exception:
+    EnhancedVoiceRecognizer = None
 
 
 # Keep track of where we came from so we can return if needed
@@ -82,6 +86,7 @@ r.non_speaking_duration = 0.2
 r.operation_timeout = 4
 
 engine = None
+voice_recognizer = EnhancedVoiceRecognizer(r) if EnhancedVoiceRecognizer is not None else None
 
 
 def _load_local_env():
@@ -184,8 +189,8 @@ last_chrome_tab_id = None
 current_chrome_tab_id = None
 
 WAKE_WORD_VARIANTS = (
-    "omega", "oh mega", "o mega", "ome ga", "amiga", "omegaa", "omegle", "omagle",
-    "mega", "ega", "ome"
+    "omega", "omegaa", "omeg", "ome", "om", "oh mega", "o mega", "oh me", "o me",
+    "ome ga", "amiga", "omegle", "omagle", "mega", "ega"
 )
 
 EXIT_PHRASE_VARIANTS = {
@@ -243,9 +248,11 @@ _apps_cache = {}
 _apps_cache_time = 0.0
 
 COMMAND_QUEUE_MAXSIZE = 32
+VOICE_QUEUE_MAXSIZE = 32
 TTS_QUEUE_MAXSIZE = 256
 
 command_queue = Queue(maxsize=COMMAND_QUEUE_MAXSIZE)
+voice_queue = Queue(maxsize=VOICE_QUEUE_MAXSIZE)
 tts_queue = Queue(maxsize=TTS_QUEUE_MAXSIZE)
 shutdown_event = Event()
 last_note_file_path = None
@@ -257,6 +264,9 @@ GEMINI_SUMMARY_MODELS = [
     "gemini-1.5-flash-latest",
 ]
 _gemini_model_cache = {"models": None, "at": 0.0}
+_summary_popup_thread = None
+_summary_popup_window = None
+_summary_popup_close_event = None
 
 _raw_print = builtins.print
 
@@ -351,19 +361,58 @@ def handle_thank_you_exit():
     return "exit"
 
 
+def _has_wake_word(text: str) -> bool:
+    """Detect wake words only when they appear at the start of the transcript."""
+    if not text:
+        return False
+
+    normalized = normalize_voice_text(text)
+    if not normalized:
+        return False
+
+    first_token = normalized.split(maxsplit=1)[0]
+    for wake_word in WAKE_WORD_VARIANTS:
+        if " " in wake_word:
+            if normalized == wake_word or normalized.startswith(f"{wake_word} "):
+                return True
+        elif first_token == wake_word:
+            return True
+
+    return False
+
+
 def _should_allow_command(voice_data: str) -> bool:
     global _last_wake_detected_at
     normalized_voice = normalize_voice_text(voice_data)
-    wake_detected = any(w in normalized_voice for w in WAKE_WORD_VARIANTS)
+    wake_detected = _has_wake_word(normalized_voice)
     if wake_detected:
         _last_wake_detected_at = time.time()
     return wake_detected or ((time.time() - _last_wake_detected_at) <= ACTIVE_COMMAND_WINDOW_SEC)
 
 
+def _voice_listener_worker():
+    while not shutdown_event.is_set():
+        try:
+            voice_data = record_audio()
+            if voice_data:
+                reply(f"I heard {voice_data}")
+                if _should_allow_command(voice_data):
+                    _enqueue_latest(voice_queue, voice_data)
+            time.sleep(0.02)
+        except SystemExit:
+            shutdown_event.set()
+        except KeyboardInterrupt:
+            reply("Interrupted by user")
+            shutdown_event.set()
+        except Exception as e:
+            print(f"Listener error: {e}")
+            time.sleep(1)
+
+
 def _command_worker():
     while not shutdown_event.is_set():
         try:
-            voice_data = command_queue.get(timeout=0.25)
+            voice_data = voice_queue.get(timeout=0.25)
         except Empty:
             continue
 
@@ -380,22 +429,7 @@ def _command_worker():
 
 
 def _audio_capture_worker():
-    while not shutdown_event.is_set():
-        try:
-            voice_data = record_audio()
-            if voice_data:
-                reply(f"I heard {voice_data}")
-                if _should_allow_command(voice_data):
-                    _enqueue_latest(command_queue, voice_data)
-            time.sleep(0.02)
-        except SystemExit:
-            shutdown_event.set()
-        except KeyboardInterrupt:
-            reply("Interrupted by user")
-            shutdown_event.set()
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            time.sleep(1)
+    _voice_listener_worker()
 
 
 def _normalize_app_key(value: str) -> str:
@@ -2575,7 +2609,7 @@ class IntentRecognizer:
         if texts:
             self.pipeline.fit(texts, labels)
             self.intent_labels = list(self.training_data.keys())
-            print("Intent recognition model trained successfully!")
+            print("Hello , How can I assist you today?")
     
     def predict_intent(self, text):
         """Predict the intent of the given text"""
@@ -2702,6 +2736,9 @@ def _best_transcript_from_google(audio):
     Request multiple STT alternatives and choose the candidate that best matches
     known assistant command phrases.
     """
+    if voice_recognizer is not None:
+        return voice_recognizer.best_transcript_from_google(audio, COMMAND_LIBRARY)
+
     primary = normalize_voice_text(r.recognize_google(audio))
     if primary:
         # Fast-path: for most utterances this avoids the slower multi-alternative pass.
@@ -2972,7 +3009,7 @@ def _summarize_screen_image_with_gemini():
         "You are summarizing the MAIN article/document content visible in this screenshot.\n"
         "Ignore headers, sidebars, menus, ads, cookie notices, and repeated UI text.\n"
         "Write a natural, readable summary focused on key ideas and important facts.\n"
-        "Output exactly one paragraph, around 100-140 words."
+        "Output exactly one paragraph,deeply focusing on content and main insights of the page "
     )
     payload = {
         "contents": [{
@@ -3040,9 +3077,99 @@ def _simple_fallback_summary(text: str, mode: str):
         return " ".join(sentences[:3])
 
 
-def _show_summary_popup(summary_text: str):
+def _is_summary_popup_active():
+    return _summary_popup_window is not None or (
+        _summary_popup_thread is not None and _summary_popup_thread.is_alive()
+    )
+
+
+def _is_summary_close_command(text):
+    if not text:
+        return False
+
+    normalized = normalize_voice_text(text)
+    if not normalized:
+        return False
+
+    return normalized in {
+        "close summary",
+        "close the summary",
+        "close summary window",
+        "close the summary window",
+        "dismiss summary",
+        "dismiss the summary",
+        "dismiss summary window",
+        "hide summary",
+        "hide the summary",
+        "hide summary window",
+    } or normalized.startswith((
+        "close summary ",
+        "close the summary ",
+        "dismiss summary ",
+        "dismiss the summary ",
+        "hide summary ",
+        "hide the summary ",
+    ))
+
+
+def _is_summary_request(text):
+    if not text:
+        return False
+
+    normalized = normalize_voice_text(text)
+    if not normalized:
+        return False
+
+    return bool(re.search(r"\b(summarize|summarise|summary)\b", normalized))
+
+
+def _is_summary_retry_command(text):
+    if not text:
+        return False
+
+    normalized = normalize_voice_text(text)
+    if not normalized:
+        return False
+
+    return bool(
+        re.search(r"\bretry\b.*\b(summarize|summarise|summary)\b", normalized)
+        or re.search(r"\b(summarize|summarise|summary)\b.*\bretry\b", normalized)
+    )
+
+
+def _close_summary_popup():
+    if not _is_summary_popup_active():
+        return False
+
+    if _summary_popup_close_event is not None:
+        _summary_popup_close_event.set()
+    return True
+
+
+def _wait_for_summary_popup_close(timeout=1.2):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _is_summary_popup_active():
+            return True
+        time.sleep(0.05)
+    return not _is_summary_popup_active()
+
+
+def _retry_summary():
+    _close_summary_popup()
+    _wait_for_summary_popup_close()
+    handle_screen_summary("retry summary")
+
+
+def _summary_popup_worker(summary_text: str, close_event: Event):
+    global _summary_popup_thread, _summary_popup_window, _summary_popup_close_event
+
+    root = None
+    this_thread = current_thread()
+
     try:
         root = tk.Tk()
+        _summary_popup_window = root
         root.title("Omega Summary")
         root.attributes("-topmost", True)
         root.geometry("680x420+120+80")
@@ -3067,8 +3194,54 @@ def _show_summary_popup(summary_text: str):
         box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         box.insert(tk.END, summary_text)
         box.configure(state="disabled")
+
+        def _request_close():
+            close_event.set()
+
+        def _monitor_close():
+            if close_event.is_set():
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+                return
+            root.after(120, _monitor_close)
+
+        root.protocol("WM_DELETE_WINDOW", _request_close)
+        root.after(120, _monitor_close)
         root.mainloop()
     except Exception as e:
+        print(f"Summary popup error: {e}")
+    finally:
+        if _summary_popup_window is root:
+            _summary_popup_window = None
+        if _summary_popup_close_event is close_event:
+            _summary_popup_close_event = None
+        if _summary_popup_thread is this_thread:
+            _summary_popup_thread = None
+
+
+def _show_summary_popup(summary_text: str):
+    global _summary_popup_thread, _summary_popup_close_event
+
+    if not summary_text:
+        return
+
+    _close_summary_popup()
+
+    close_event = Event()
+    _summary_popup_close_event = close_event
+    _summary_popup_thread = Thread(
+        target=_summary_popup_worker,
+        args=(summary_text, close_event),
+        daemon=True,
+    )
+
+    try:
+        _summary_popup_thread.start()
+    except Exception as e:
+        _summary_popup_thread = None
+        _summary_popup_close_event = None
         print(f"Summary popup error: {e}")
 
 
@@ -3408,36 +3581,39 @@ def record_audio():
     try:
         _voice_show_listening()
         with sr.Microphone() as source:
-            now = time.time()
-            should_recalibrate = (
-                (not _audio_calibrated)
-                or (now - _last_ambient_calibration_at) > AMBIENT_RECALIBRATE_EVERY_SEC
-            )
-            if should_recalibrate:
-                r.adjust_for_ambient_noise(source, duration=AMBIENT_CALIBRATION_DURATION_SEC)
-                _audio_calibrated = True
-                _last_ambient_calibration_at = now
+            try:
+                if voice_recognizer is not None:
+                    voice_data = voice_recognizer.capture_and_recognize(source, COMMAND_LIBRARY)
+                else:
+                    now = time.time()
+                    should_recalibrate = (
+                        (not _audio_calibrated)
+                        or (now - _last_ambient_calibration_at) > AMBIENT_RECALIBRATE_EVERY_SEC
+                    )
+                    if should_recalibrate:
+                        r.adjust_for_ambient_noise(source, duration=AMBIENT_CALIBRATION_DURATION_SEC)
+                        _audio_calibrated = True
+                        _last_ambient_calibration_at = now
 
-            r.energy_threshold = max(180, int(r.energy_threshold))
-            audio = r.listen(
-                source,
-                timeout=LISTEN_TIMEOUT_SEC,
-                phrase_time_limit=LISTEN_PHRASE_TIME_LIMIT_SEC,
-            )
-            
-        try:
-            voice_data = _best_transcript_from_google(audio)
-            voice_data = normalize_voice_text(voice_data)
-            print(f"Recognized: {voice_data}")
-            _voice_show_recognized(voice_data)
-            return voice_data
-        except sr.UnknownValueError:
-            return ""
-        except sr.RequestError as e:
-            print(f"Speech recognition error: {e}")
-            reply('Speech recognition service error. Check internet connection.')
-            _voice_hide()
-            return ""
+                    r.energy_threshold = max(180, int(r.energy_threshold))
+                    audio = r.listen(
+                        source,
+                        timeout=LISTEN_TIMEOUT_SEC,
+                        phrase_time_limit=LISTEN_PHRASE_TIME_LIMIT_SEC,
+                    )
+                    voice_data = _best_transcript_from_google(audio)
+                    voice_data = normalize_voice_text(voice_data)
+
+                print(f"Recognized: {voice_data}")
+                _voice_show_recognized(voice_data)
+                return voice_data
+            except sr.UnknownValueError:
+                return ""
+            except sr.RequestError as e:
+                print(f"Speech recognition error: {e}")
+                reply('Speech recognition service error. Check internet connection.')
+                _voice_hide()
+                return ""
             
     except sr.WaitTimeoutError:
         _voice_hide()
@@ -4316,6 +4492,17 @@ def respond(voice_data):
         handle_discard_options()
         return
 
+    if _is_summary_close_command(pv):
+        if _close_summary_popup():
+            reply("Closed the summary window.")
+        else:
+            reply("No summary window is open.")
+        return
+
+    if _is_summary_retry_command(pv):
+        _retry_summary()
+        return
+
     if is_close_app_command(pv):
         close_candidate = normalize_close_app_query(pv)
         if close_candidate:
@@ -4358,10 +4545,7 @@ def respond(voice_data):
         _read_latest_note()
         return
 
-    if any(x in pv for x in (
-        "summarize this page", "summarize page", "summary of this page",
-        "summarise this page", "summarise page", "summary this page"
-    )):
+    if _is_summary_request(pv):
         handle_screen_summary(pv)
         return
 
@@ -4565,7 +4749,7 @@ if __name__ == "__main__":
 
     tts_thread = Thread(target=_tts_worker, daemon=True)
     cmd_thread = Thread(target=_command_worker, daemon=True)
-    audio_thread = Thread(target=_audio_capture_worker, daemon=True)
+    audio_thread = Thread(target=_voice_listener_worker, daemon=True)
     tts_thread.start()
     cmd_thread.start()
     audio_thread.start()
@@ -4575,7 +4759,7 @@ if __name__ == "__main__":
     while not shutdown_event.is_set():
         time.sleep(0.1)
 
-    _enqueue_latest(command_queue, None)
+    _enqueue_latest(voice_queue, None)
     _enqueue_latest(tts_queue, None)
     audio_thread.join(timeout=1.2)
     cmd_thread.join(timeout=1.2)
