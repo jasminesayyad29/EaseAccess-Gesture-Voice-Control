@@ -79,11 +79,11 @@ keyboard = Controller()
 # Voice recognition tuning (balanced for noisy rooms)
 r.dynamic_energy_threshold = True
 r.dynamic_energy_adjustment_damping = 0.15
-r.dynamic_energy_ratio = 1.55
-r.pause_threshold = 0.45
+r.dynamic_energy_ratio = 1.45
+r.pause_threshold = 0.72
 r.phrase_threshold = 0.15
-r.non_speaking_duration = 0.2
-r.operation_timeout = 4
+r.non_speaking_duration = 0.32
+r.operation_timeout = 6
 
 engine = None
 voice_recognizer = EnhancedVoiceRecognizer(r) if EnhancedVoiceRecognizer is not None else None
@@ -218,6 +218,54 @@ COMMON_STT_FIXES = {
     "go too tab": "go to tab",
     "opun": "open",
     "clik": "click",
+    "opened": "open",
+    "opening": "open",
+    "launched": "launch",
+    "launching": "launch",
+    "started": "start",
+    "starting": "start",
+    "ran": "run",
+    "running": "run",
+    "closed": "close",
+    "closing": "close",
+    "quit application": "close application",
+    "quitted": "quit",
+    "exited": "exit",
+    "stopped": "stop",
+    "ending": "end",
+    "terminated": "terminate",
+    "killed": "kill",
+    "clicked": "click",
+    "clicking": "click",
+    "tapped": "tap",
+    "tapping": "tap",
+    "pressed": "press",
+    "pressing": "press",
+    "searched": "search",
+    "searching": "search",
+    "found": "find",
+    "looking up": "look up",
+    "selected": "select",
+    "selecting": "select",
+    "chose": "choose",
+    "chosen": "choose",
+    "choosing": "choose",
+    "copied": "copy",
+    "copying": "copy",
+    "pasted": "paste",
+    "pasting": "paste",
+    "typed": "type",
+    "typing": "type",
+    "wrote": "write",
+    "writing": "write",
+    "scrolled": "scroll",
+    "scrolling": "scroll",
+    "maximized": "maximize",
+    "maximised": "maximize",
+    "maximizing": "maximize",
+    "minimized": "minimize",
+    "minimised": "minimize",
+    "minimizing": "minimize",
 }
 
 APP_ALIAS_GROUPS = {
@@ -236,9 +284,9 @@ APP_DIRECT_EXECUTABLES = {
 
 AMBIENT_RECALIBRATE_EVERY_SEC = 90
 ACTIVE_COMMAND_WINDOW_SEC = 15
-AMBIENT_CALIBRATION_DURATION_SEC = 0.18
-LISTEN_TIMEOUT_SEC = 1.2
-LISTEN_PHRASE_TIME_LIMIT_SEC = 2.8
+AMBIENT_CALIBRATION_DURATION_SEC = 0.12
+LISTEN_TIMEOUT_SEC = 1.5
+LISTEN_PHRASE_TIME_LIMIT_SEC = 7.0
 _audio_calibrated = False
 _last_ambient_calibration_at = 0.0
 _last_wake_detected_at = 0.0
@@ -258,6 +306,7 @@ shutdown_event = Event()
 last_note_file_path = None
 
 NOTEBOOK_FILENAME = "Notesbyomega.txt"
+PLANNED_COMMAND_SEPARATOR = " || "
 GEMINI_SUMMARY_MODELS = [
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
@@ -420,12 +469,28 @@ def _command_worker():
             break
 
         try:
-            result = respond(voice_data)
-            if result == "exit":
-                shutdown_event.set()
+            for planned_voice_data in _expand_planned_voice_commands(voice_data):
+                result = respond(planned_voice_data)
+                if result == "exit":
+                    shutdown_event.set()
+                    break
+                time.sleep(0.15)
+            if shutdown_event.is_set():
                 break
         except Exception as e:
             print(f"Command worker error: {e}")
+
+
+def _expand_planned_voice_commands(voice_data):
+    if isinstance(voice_data, (list, tuple)):
+        return [str(item).strip() for item in voice_data if str(item).strip()]
+
+    text = str(voice_data or "").strip()
+    if not text:
+        return []
+    if PLANNED_COMMAND_SEPARATOR not in text:
+        return [text]
+    return [part.strip() for part in text.split(PLANNED_COMMAND_SEPARATOR) if part.strip()]
 
 
 def _audio_capture_worker():
