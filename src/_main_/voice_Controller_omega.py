@@ -37,6 +37,7 @@ from difflib import get_close_matches
 import win32gui
 import win32con
 import win32api
+import win32process
 import pythoncom
 import pychrome
 from queue import Queue, Empty, Full
@@ -59,6 +60,12 @@ paste_word_target = None      # the word like "stay" / "save"
 
 paste_position_mode = None      
 paste_position_boxes = []
+
+dictation_mode = False
+dictation_target_mode = None     # "before", "after", "select", "delete", "replace"
+dictation_target_boxes = []
+dictation_target_text = ""
+dictation_replacement_text = ""
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -181,6 +188,7 @@ COMMON_STT_FIXES = {
     "go too tab": "go to tab",
     "opun": "open",
     "clik": "click",
+    "zoomin":"zoom in",
 }
 
 APP_ALIAS_GROUPS = {
@@ -312,6 +320,8 @@ def handle_thank_you_exit():
 
 def _should_allow_command(voice_data: str) -> bool:
     global _last_wake_detected_at
+    if dictation_mode:
+        return True
     normalized_voice = normalize_voice_text(voice_data)
     wake_detected = any(w in normalized_voice for w in WAKE_WORD_VARIANTS)
     if wake_detected:
@@ -479,6 +489,555 @@ def _type_into_first_input_box(text):
         return True
     except Exception:
         return False
+
+def _get_active_process_name():
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        return (psutil.Process(pid).name() or "").lower()
+    except Exception:
+        return ""
+
+def _set_clipboard_text(text):
+    win32clipboard = None
+    try:
+        import win32clipboard
+        win32clipboard.OpenClipboard()
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+        win32clipboard.CloseClipboard()
+        return True
+    except Exception as e:
+        print(f"clipboard error: {e}")
+        try:
+            if win32clipboard is not None:
+                win32clipboard.CloseClipboard()
+        except Exception:
+            pass
+        return False
+
+def _paste_text_exact(text):
+    """Paste text so multi-line text, uppercase, symbols, and single letters stay exact."""
+    if not text:
+        return False
+
+    if _set_clipboard_text(text):
+        with keyboard.pressed(Key.ctrl):
+            keyboard.press('v')
+            keyboard.release('v')
+        return True
+
+    try:
+        pyautogui.write(text, interval=0.02)
+        return True
+    except Exception:
+        return False
+
+def _focus_chrome_text_entry():
+    proc_name = _get_active_process_name()
+    if not any(name in proc_name for name in ("chrome", "msedge", "brave", "opera", "firefox")):
+        return False
+
+    try:
+        pyautogui.hotkey('ctrl', 'l')
+        time.sleep(0.1)
+        return True
+    except Exception:
+        return False
+
+def _activate_window_by_keywords(keywords):
+    try:
+        titles = gw.getAllTitles()
+        for title in titles:
+            if title and any(keyword.lower() in title.lower() for keyword in keywords):
+                windows = gw.getWindowsWithTitle(title)
+                if not windows:
+                    continue
+                win = windows[0]
+                if win.isMinimized:
+                    win.restore()
+                win.activate()
+                time.sleep(0.4)
+                return True
+    except Exception as e:
+        print(f"_activate_window_by_keywords error: {e}")
+    return False
+
+def _click_ocr_text(targets, fuzzy_threshold=0.72):
+    try:
+        screen = ImageGrab.grab()
+        data = pytesseract.image_to_data(screen, output_type=Output.DICT)
+        targets = [t.lower() for t in targets]
+
+        for i, raw_text in enumerate(data.get("text", [])):
+            label = (raw_text or "").strip().lower()
+            if not label:
+                continue
+            if any(t in label or SequenceMatcher(None, t, label).ratio() >= fuzzy_threshold for t in targets):
+                x = data["left"][i]
+                y = data["top"][i]
+                w = data["width"][i]
+                h = data["height"][i]
+                pyautogui.click(x + w // 2, y + h // 2)
+                time.sleep(0.2)
+                return True
+    except Exception as e:
+        print(f"_click_ocr_text error: {e}")
+    return False
+
+def _focus_word_text_entry():
+    proc_name = _get_active_process_name()
+    if "winword" not in proc_name:
+        if not _activate_window_by_keywords(["word", "microsoft word", ".doc", ".docx"]):
+            return False
+        proc_name = _get_active_process_name()
+        if "winword" not in proc_name:
+            return False
+
+    _click_ocr_text(["enable editing", "enable content"], fuzzy_threshold=0.62)
+    time.sleep(0.3)
+
+    try:
+        screen_w, screen_h = pyautogui.size()
+        pyautogui.click(screen_w // 2, int(screen_h * 0.48))
+        time.sleep(0.1)
+        return True
+    except Exception:
+        return False
+
+def _focus_general_text_entry():
+    if _focus_chrome_text_entry():
+        return True
+    if _focus_word_text_entry():
+        return True
+    return True
+
+def _spoken_text_to_literal(text):
+    """Convert spoken dictation controls into actual punctuation/new lines."""
+    if not text:
+        return ""
+
+    cleaned = text.strip()
+    lowered = cleaned.lower()
+
+    literal_phrases = {
+        "word new paragraph": "new paragraph",
+        "word new line": "new line",
+        "word next line": "next line",
+        "word line break": "line break",
+        "word space bar": "space bar",
+        "word space": "space",
+        "word tab": "tab",
+        "word comma": "comma",
+        "word full stop": "full stop",
+        "word period": "period",
+        "word dot": "dot",
+        "word question mark": "question mark",
+        "word exclamation mark": "exclamation mark",
+        "word colon": "colon",
+        "word semicolon": "semicolon",
+        "word dash": "dash",
+        "word hyphen": "hyphen",
+        "word slash": "slash",
+        "word backslash": "backslash",
+        "word at sign": "at sign",
+        "word number sign": "number sign",
+        "word hash": "hash",
+    }
+    protected_literals = {}
+    for index, (spoken, literal) in enumerate(sorted(literal_phrases.items(), key=lambda item: len(item[0]), reverse=True)):
+        placeholder = f"__literal_{index}__"
+        if spoken in lowered:
+            lowered = re.sub(rf"\b{re.escape(spoken)}\b", placeholder, lowered)
+            protected_literals[placeholder] = literal
+
+    dynamic_literal_patterns = [
+        (r"\bword\s+(capital|uppercase|upper case)\s+([a-z])\b", lambda m: f"capital {m.group(2)}"),
+        (r"\bword\s+(small|lowercase|lower case)\s+([a-z])\b", lambda m: f"{m.group(1)} {m.group(2)}"),
+        (r"\bword\s+letter\s+([a-z])\b", lambda m: f"letter {m.group(1)}"),
+        (r"\bword\s+(number|digit)\s+([a-z0-9]+)\b", lambda m: f"{m.group(1)} {m.group(2)}"),
+    ]
+    for pattern, repl in dynamic_literal_patterns:
+        while True:
+            match = re.search(pattern, lowered)
+            if not match:
+                break
+            placeholder = f"__literal_dynamic_{len(protected_literals)}__"
+            protected_literals[placeholder] = repl(match)
+            lowered = lowered[:match.start()] + placeholder + lowered[match.end():]
+
+    single_map = {
+        "space": " ",
+        "tab": "\t",
+        "enter": "\n",
+        "new line": "\n",
+        "next line": "\n",
+        "line break": "\n",
+        "new paragraph": "\n\n",
+        "comma": ",",
+        "coma": ",",
+        "comoa": ",",
+        "full stop": ".",
+        "period": ".",
+        "dot": ".",
+        "question mark": "?",
+        "question marks": "?",
+        "questionmark": "?",
+        "exclamation mark": "!",
+        "exclamation point": "!",
+        "colon": ":",
+        "semicolon": ";",
+        "dash": "-",
+        "hyphen": "-",
+        "slash": "/",
+        "backslash": "\\",
+        "at sign": "@",
+        "number sign": "#",
+        "hash": "#",
+    }
+    if lowered in single_map:
+        literal = single_map[lowered]
+        if literal in {",", ".", "?", "!", ":", ";"}:
+            return literal + " "
+        if literal == "-":
+            return " - "
+        return literal
+
+    number_words = {
+        "zero": "0", "one": "1", "two": "2", "to": "2", "too": "2",
+        "three": "3", "four": "4", "five": "5", "six": "6",
+        "seven": "7", "eight": "8", "nine": "9",
+    }
+
+    m = re.fullmatch(r"(?:capital|uppercase|upper case)\s+([a-z])", lowered)
+    if m:
+        return m.group(1).upper()
+
+    m = re.fullmatch(r"(?:small|lowercase|lower case)\s+([a-z])", lowered)
+    if m:
+        return m.group(1).lower()
+
+    m = re.fullmatch(r"(?:letter)\s+([a-z])", lowered)
+    if m:
+        return m.group(1)
+
+    m = re.fullmatch(r"(?:number|digit)\s+([a-z0-9]+)", lowered)
+    if m:
+        value = m.group(1)
+        return number_words.get(value, value)
+
+    output = lowered
+
+    output = re.sub(
+        r"\b(?:capital|uppercase|upper case)\s+([a-z])\b",
+        lambda m: m.group(1).upper(),
+        output,
+    )
+    output = re.sub(
+        r"\b(?:small|lowercase|lower case)\s+([a-z])\b",
+        lambda m: m.group(1).lower(),
+        output,
+    )
+    output = re.sub(r"\bletter\s+([a-z])\b", lambda m: m.group(1), output)
+    output = re.sub(
+        r"\b(?:number|digit)\s+([a-z0-9]+)\b",
+        lambda m: number_words.get(m.group(1), m.group(1)),
+        output,
+    )
+
+    replacements = [
+        (r"\bnew paragraph\b", "\n\n"),
+        (r"\bnew line\b", "\n"),
+        (r"\bnext line\b", "\n"),
+        (r"\bline break\b", "\n"),
+        (r"\bspace bar\b", " "),
+        (r"\bspace\b", " "),
+        (r"\btab\b", "\t"),
+        (r"\bcomma\b", ","),
+        (r"\bcoma\b", ","),
+        (r"\bcomoa\b", ","),
+        (r"\bfull stop\b", "."),
+        (r"\bperiod\b", "."),
+        (r"\bquestion mark\b", "?"),
+        (r"\bquestion marks\b", "?"),
+        (r"\bquestionmark\b", "?"),
+        (r"\bexclamation mark\b", "!"),
+        (r"\bexclamation point\b", "!"),
+        (r"\bcolon\b", ":"),
+        (r"\bsemicolon\b", ";"),
+        (r"\bdash\b", " - "),
+        (r"\bhyphen\b", "-"),
+        (r"\bslash\b", "/"),
+        (r"\bbackslash\b", "\\"),
+        (r"\bat sign\b", "@"),
+        (r"\bnumber sign\b", "#"),
+        (r"\bhash\b", "#"),
+    ]
+    for pattern, value in replacements:
+        output = re.sub(pattern, lambda _m, replacement=value: replacement, output)
+    output = re.sub(r"\s+([,.?!:;])", r"\1", output)
+    output = re.sub(r" ?\n ?", "\n", output)
+    output = re.sub(r"[ \t]{2,}", " ", output)
+    if output and output[-1] in ",.?!:;":
+        output += " "
+
+    for placeholder, literal in protected_literals.items():
+        output = output.replace(placeholder, literal)
+
+    return output
+
+def handle_standalone_dictation_control(command):
+    command = strip_wake_word(command.strip())
+    command = re.sub(r"\s+", " ", command).strip()
+
+    key_controls = {
+        "space": "space",
+        "space bar": "space",
+        "tab": "tab",
+        "enter": "enter",
+        "new line": "enter",
+        "next line": "enter",
+        "line break": "enter",
+    }
+    if command in key_controls:
+        pyautogui.press(key_controls[command])
+        return True
+
+    if command in {"new paragraph", "next paragraph"}:
+        pyautogui.press('enter')
+        pyautogui.press('enter')
+        return True
+
+    text_controls = {
+        "comma": ", ",
+        "coma": ", ",
+        "comoa": ", ",
+        "full stop": ". ",
+        "period": ". ",
+        "dot": ".",
+        "question mark": "? ",
+        "questionmark": "? ",
+        "exclamation mark": "! ",
+        "exclamation point": "! ",
+        "colon": ": ",
+        "semicolon": "; ",
+        "dash": " - ",
+        "hyphen": "-",
+        "slash": "/",
+        "forward slash": "/",
+        "backslash": "\\",
+        "at sign": "@",
+        "at": "@",
+        "hash": "#",
+        "number sign": "#",
+        "percent": "%",
+        "ampersand": "&",
+        "open bracket": "(",
+        "close bracket": ")",
+    }
+    if command in text_controls:
+        return _paste_text_exact(text_controls[command])
+
+    return False
+
+def _move_caret_near_spoken_target(command):
+    m = re.search(r"\b(before|after)\s+(.+)$", command)
+    if not m:
+        return True
+
+    mode = m.group(1)
+    target = m.group(2).strip()
+    if not target:
+        return False
+
+    boxes = find_text_boxes(target)
+    if not boxes:
+        reply(f"I couldn't find {target} on the screen.")
+        return False
+
+    x, y, w, h = boxes[0]
+    click_x = x + 2 if mode == "before" else x + w - 2
+    pyautogui.click(click_x, y + h // 2)
+    time.sleep(0.1)
+    return True
+
+def _select_ocr_box_text(box):
+    x, y, w, h = box
+    start_x = max(x - 3, 0)
+    end_x = x + w + 3
+    click_y = y + h // 2
+
+    pyautogui.click(start_x, click_y)
+    time.sleep(0.08)
+    pyautogui.keyDown('shift')
+    pyautogui.click(end_x, click_y)
+    pyautogui.keyUp('shift')
+    time.sleep(0.08)
+
+def _apply_dictation_target_box(box):
+    global dictation_target_mode, dictation_target_boxes
+    global dictation_target_text, dictation_replacement_text
+
+    mode = dictation_target_mode
+    replacement = dictation_replacement_text
+
+    clear_on_screen_boxes()
+
+    if mode in ("before", "after"):
+        x, y, w, h = box
+        click_x = x + 2 if mode == "before" else x + w - 2
+        pyautogui.click(click_x, y + h // 2)
+        reply(f"Cursor moved {mode} {dictation_target_text}.")
+    elif mode == "select":
+        _select_ocr_box_text(box)
+        reply(f"Selected {dictation_target_text}.")
+    elif mode == "delete":
+        _select_ocr_box_text(box)
+        pyautogui.press('backspace')
+        reply(f"Deleted {dictation_target_text}.")
+    elif mode == "replace":
+        _select_ocr_box_text(box)
+        _paste_text_exact(_spoken_text_to_literal(replacement))
+        reply(f"Replaced {dictation_target_text}.")
+
+    dictation_target_mode = None
+    dictation_target_boxes = []
+    dictation_target_text = ""
+    dictation_replacement_text = ""
+
+def handle_dictation_target_choice(num: int):
+    global dictation_target_boxes
+
+    if not dictation_target_boxes:
+        return False
+
+    index = num - 1
+    if index < 0 or index >= len(dictation_target_boxes):
+        reply("Invalid option number.")
+        return True
+
+    _apply_dictation_target_box(dictation_target_boxes[index])
+    return True
+
+def _start_dictation_target_action(mode, target, replacement=""):
+    global dictation_target_mode, dictation_target_boxes
+    global dictation_target_text, dictation_replacement_text
+
+    target = (target or "").strip()
+    if not target:
+        reply("Which word or phrase should I use?")
+        return True
+
+    boxes = find_text_boxes(target)
+    if not boxes:
+        reply(f"I couldn't find {target} on the screen.")
+        return True
+
+    dictation_target_mode = mode
+    dictation_target_text = target
+    dictation_replacement_text = replacement
+
+    if len(boxes) == 1:
+        _apply_dictation_target_box(boxes[0])
+        return True
+
+    dictation_target_boxes = boxes
+    show_numbered_boxes(dictation_target_boxes)
+    reply(f"I found multiple matches for {target}. Say choose 1, choose 2, etc.")
+    return True
+
+def handle_dictation_edit_command(command):
+    command = strip_wake_word(command.strip())
+
+    if command in {"undo", "undo that", "undo last", "mistake"}:
+        pyautogui.hotkey('ctrl', 'z')
+        reply("Undone.")
+        return True
+
+    if command in {"delete last word", "remove last word", "erase last word"}:
+        pyautogui.hotkey('ctrl', 'backspace')
+        reply("Deleted the word before the cursor.")
+        return True
+
+    if command in {"delete last line", "remove last line", "erase last line"}:
+        pyautogui.hotkey('shift', 'home')
+        pyautogui.press('backspace')
+        reply("Deleted text before the cursor on this line.")
+        return True
+
+    m = re.match(r"^(?:move cursor|cursor|go|move)\s+(before|after)\s+(.+)$", command)
+    if m:
+        return _start_dictation_target_action(m.group(1), m.group(2))
+
+    m = re.match(r"^(?:insert|add text|add|type|write)\s+(before|after)\s+(.+)$", command)
+    if m:
+        return _start_dictation_target_action(m.group(1), m.group(2))
+
+    m = re.match(r"^(?:select word|select)\s+(.+)$", command)
+    if m:
+        return _start_dictation_target_action("select", m.group(1))
+
+    m = re.match(r"^(?:delete word|remove word|erase word|delete)\s+(.+)$", command)
+    if m:
+        return _start_dictation_target_action("delete", m.group(1))
+
+    m = re.match(r"^(?:replace|correct)\s+(.+?)\s+(?:with|to)\s+(.+)$", command)
+    if m:
+        return _start_dictation_target_action("replace", m.group(1), m.group(2))
+
+    return False
+
+def _extract_text_entry_payload(command):
+    text = strip_wake_word(command.strip())
+    text = re.sub(r"^(?:type|write|enter|send|add text|insert text|dictate)\s+", "", text).strip()
+
+    position = re.search(r"\b(?:before|after)\s+.+$", text)
+    position_command = position.group(0) if position else ""
+    if position:
+        text = text[:position.start()].strip()
+
+    return text, position_command
+
+def handle_text_entry_command(command):
+    text_payload, position_command = _extract_text_entry_payload(command)
+    literal_text = _spoken_text_to_literal(text_payload)
+
+    if not literal_text:
+        reply("Please say the text you want me to type.")
+        return True
+
+    if position_command:
+        if not _move_caret_near_spoken_target(position_command):
+            return True
+    else:
+        _focus_general_text_entry()
+
+    if _paste_text_exact(literal_text):
+        reply("Text added.")
+    else:
+        reply("I couldn't type that text.")
+    return True
+
+def is_text_entry_command(command):
+    command = strip_wake_word(command.strip())
+    return bool(re.match(r"^(?:type|write|enter|send|add text|insert text|dictate)\s+", command))
+
+def handle_dictation_control(command):
+    global dictation_mode
+    command = strip_wake_word(command.strip())
+
+    if command in {"start typing", "start dictation", "dictation mode", "turn on dictation"}:
+        dictation_mode = True
+        _focus_general_text_entry()
+        reply("Dictation mode on.")
+        return True
+
+    if command in {"stop typing", "stop dictation", "end dictation", "turn off dictation"}:
+        dictation_mode = False
+        reply("Dictation mode off.")
+        return True
+
+    return False
 
 def normalize_app_query(text):
     """Extract app name from variants like 'open chrome' and 'open app chrome'."""
@@ -2262,8 +2821,6 @@ def focus_powerpoint():
     import pyautogui
     import time
 
-    pyautogui.press("esc")
-
     try:
         keywords_slideshow = ["Slide Show", "PowerPoint Slide Show"]
         keywords_editor = ["PowerPoint", "Microsoft PowerPoint", "Presentation"]
@@ -2589,6 +3146,16 @@ class IntentRecognizer:
         
         import re
 
+        # Check multi-word presentation phrases first (before single keywords)
+        presentation_phrases = ['start presentation', 'begin slideshow', 'end presentation', 'stop presentation', 
+                               'pause presentation', 'resume presentation', 'exit slideshow', 'go back a slide',
+                               'go to next slide', 'exit full screen']
+        for phrase in presentation_phrases:
+            pattern = rf'\b{re.escape(phrase)}\b'
+            if re.search(pattern, text_lower):
+                return 'presentation_control'
+
+        # Now check other keywords
         for intent, keywords in intent_keywords.items():
             for keyword in keywords:
                 # Match whole words only
@@ -2630,6 +3197,9 @@ def _best_transcript_from_google(audio):
     known assistant command phrases.
     """
     primary = normalize_voice_text(r.recognize_google(audio))
+    if dictation_mode:
+        return primary
+
     if primary:
         # Fast-path: for most utterances this avoids the slower multi-alternative pass.
         if len(primary.split()) >= 2:
@@ -3496,6 +4066,8 @@ def handle_discard_options():
     global last_tab_boxes, last_tab_target
     global paste_position_mode, paste_position_boxes
     global paste_word_mode, paste_word_boxes, paste_word_target
+    global dictation_target_mode, dictation_target_boxes
+    global dictation_target_text, dictation_replacement_text
     global range_mode, range_phase
     global range_start_occurrences, range_end_occurrences
     global range_start_phrase, range_end_phrase, range_selected_start
@@ -3512,6 +4084,10 @@ def handle_discard_options():
     paste_word_mode = None
     paste_word_boxes = []
     paste_word_target = None
+    dictation_target_mode = None
+    dictation_target_boxes = []
+    dictation_target_text = ""
+    dictation_replacement_text = ""
 
     range_mode = None
     range_phase = None
@@ -3531,6 +4107,7 @@ def _has_pending_options():
         or (range_mode is not None)
         or (paste_position_mode == "active")
         or (paste_word_mode is not None)
+        or (dictation_target_mode is not None)
     )
 
 
@@ -3549,6 +4126,10 @@ def _dispatch_option_number(num: int):
 
     if paste_word_mode is not None:
         handle_paste_word_choice(num)
+        return
+
+    if dictation_target_mode is not None:
+        handle_dictation_target_choice(num)
         return
 
     handle_choice_selection(num)
@@ -3649,13 +4230,33 @@ def handle_presentation_control(command):
         
         elif any(kw in command for kw in ["start", "begin", "show", "play", "slideshow", "present"]):
             print("🎬 Starting presentation...")
-            success = focus_powerpoint()  # make sure PowerPoint is active
-            if success:
-                time.sleep(0.8)
-                pyautogui.press("f5")  # Start presentation from beginning
-                reply("Starting your presentation now.")
-            else:
-                reply("I couldn't find PowerPoint to start the presentation.")
+            print(f"DEBUG: Command received: '{command}'")
+            try:
+                import pygetwindow as gw
+                time.sleep(0.5)
+                # Find PowerPoint window and activate it
+                all_titles = gw.getAllTitles()
+                print(f"All window titles: {all_titles}")
+                # Check for PowerPoint, Presentation, or .pptx/.ppt files
+                ppt_titles = [t for t in all_titles if any(kw in t.lower() for kw in ["powerpoint", "presentation", ".pptx", ".ppt"])]
+                
+                if ppt_titles:
+                    ppt_win = gw.getWindowsWithTitle(ppt_titles[-1])[0]
+                    print(f"Found PowerPoint: {ppt_titles[-1]}")
+                    ppt_win.activate()
+                    time.sleep(0.5)
+                    ppt_win.restore()
+                    time.sleep(1)
+                    print("✅ PowerPoint now in focus, starting F5...")
+                    pyautogui.press("f5")
+                    time.sleep(2)
+                    reply("Starting your presentation now.")
+                else:
+                    print(f"PowerPoint not found. Available titles: {all_titles}")
+                    reply("I couldn't find PowerPoint. Please open it first.")
+            except Exception as e:
+                print(f"Error in presentation start: {e}")
+                reply("Error starting presentation.")
         
         elif any(kw in command for kw in ["end", "exit", "stop", "close"]):
             print("🛑 Exiting full screen or slideshow...")
@@ -3779,7 +4380,8 @@ def handle_click_action(entity, full_cmd):
 
 # Executes Commands (input: string)
 def respond(voice_data):
-    global file_exp_status, files, is_awake, current_directory
+    global file_exp_status, files, is_awake, current_directory, dictation_mode
+    global dictation_target_mode
     
     if not voice_data:
         return
@@ -3811,6 +4413,27 @@ def respond(voice_data):
         handle_discard_options()
         return
 
+    if handle_dictation_control(pv):
+        return
+
+    if dictation_mode:
+        if dictation_target_mode is not None:
+            num = parse_choice_number(pv)
+            if num:
+                handle_dictation_target_choice(num)
+                return
+
+        if handle_dictation_edit_command(pv):
+            return
+
+        if handle_standalone_dictation_control(pv):
+            return
+
+        literal_text = _spoken_text_to_literal(pv)
+        if literal_text:
+            _paste_text_exact(literal_text)
+        return
+
     if is_close_app_command(pv):
         close_candidate = normalize_close_app_query(pv)
         if close_candidate:
@@ -3831,6 +4454,14 @@ def respond(voice_data):
             _dispatch_option_number(num)
             return
 
+    # Check for presentation control commands BEFORE app-open (since "start presentation" would match app-open)
+    presentation_keywords = ["start presentation", "begin slideshow", "end presentation", "stop presentation", 
+                             "pause presentation", "resume presentation", "exit slideshow", "next slide", 
+                             "previous slide", "go back a slide", "go to next slide"]
+    if any(kw in pv.lower() for kw in presentation_keywords):
+        handle_presentation_control(pv)
+        return
+
     # Deterministic app-open handling for:
     # - "open chrome"
     # - "open app chrome"
@@ -3841,16 +4472,9 @@ def respond(voice_data):
             handle_open_app(app_candidate)
             return
 
-    if pv.startswith(("type ", "write ", "enter ", "send ")):
-        match = re.match(r"^(?:type|write|enter|send)\s+(.+)$", pv)
-        if match:
-            text_to_write = match.group(1).strip()
-            if text_to_write:
-                if _type_into_first_input_box(text_to_write):
-                    reply(f"Wrote {text_to_write}.")
-                else:
-                    reply("I could not focus the first input box.")
-                return
+    if is_text_entry_command(pv):
+        handle_text_entry_command(pv)
+        return
 
     if pv in {"send", "enter"}:
         pyautogui.press('enter')
