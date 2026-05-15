@@ -6,6 +6,9 @@ import pyautogui
 TRANSPARENT_KEY = "#ff00ff"
 MOVE_DOWN_PIXELS = 65
 ICON_GAP_PIXELS = 10
+BACKGROUND_COLOR = "#202020"
+FOREGROUND_COLOR = "#ffffff"
+BORDER_COLOR = "#666666"
 
 try:
     import tkinter as tk
@@ -80,6 +83,20 @@ class VoiceStateIndicator:
             self._canvas.itemconfigure(self._emoji_item, text=symbol)
             if self._text_item is not None and recognized_text is not None:
                 self._canvas.itemconfigure(self._text_item, text=recognized_text)
+
+            self._root.update_idletasks()
+            bbox = self._canvas.bbox(self._text_item)
+            if bbox is not None:
+                text_height = bbox[3] - bbox[1]
+                new_h = max(self._icon_size + 12, int(text_height + 18))
+            else:
+                new_h = self._icon_size + 12
+
+            self._canvas.config(height=new_h)
+            self._canvas.coords(self._background_rect, 0, 0, self._total_w, new_h)
+            self._canvas.coords(self._emoji_item, int(self._icon_size * 0.50), int(new_h * 0.50))
+            self._canvas.coords(self._text_item, int(self._icon_size + self._text_gap), int(new_h * 0.50))
+            self._root.geometry(f"{self._total_w}x{new_h}+{self._root.winfo_x()}+{self._root.winfo_y()}")
             self._root.deiconify()
             if auto_hide_ms is not None and auto_hide_ms > 0:
                 self._hide_after_id = self._root.after(auto_hide_ms, self._root.withdraw)
@@ -101,46 +118,49 @@ class VoiceStateIndicator:
                 pass
 
             icon_size, x, y = self._compute_geometry()
-            text_gap = max(8, int(round(icon_size * 0.20)))
-            text_area = int(max(120, min(420, icon_size * 4.8)))
-            total_w = icon_size + text_gap + text_area
-            total_h = icon_size
+            self._icon_size = icon_size
+            self._text_gap = max(8, int(round(icon_size * 0.20)))
+            text_area = int(max(260, min(760, icon_size * 8.0)))
+            self._total_w = icon_size + self._text_gap + text_area + 12
+            total_h = icon_size + 12
             card = tk.Frame(
                 self._root,
-                bg=TRANSPARENT_KEY,
+                bg=BACKGROUND_COLOR,
                 bd=0,
                 relief="flat",
                 highlightthickness=0,
-                highlightbackground=TRANSPARENT_KEY,
-                width=total_w,
+                highlightbackground=BACKGROUND_COLOR,
+                width=self._total_w,
                 height=total_h,
             )
             card.pack(fill="both", expand=True)
             card.pack_propagate(False)
 
-            self._canvas = tk.Canvas(card, width=total_w, height=total_h, bg=TRANSPARENT_KEY, highlightthickness=0)
+            self._canvas = tk.Canvas(card, width=self._total_w, height=total_h, bg=BACKGROUND_COLOR, highlightthickness=0)
             self._canvas.place(x=0, y=0)
+            self._background_rect = self._canvas.create_rectangle(0, 0, self._total_w, total_h, fill=BACKGROUND_COLOR, outline=BORDER_COLOR, width=1)
 
             label_font = max(14, int(round(icon_size * 0.34)))
             self._emoji_item = self._canvas.create_text(
                 int(icon_size * 0.50),
-                int(icon_size * 0.50),
+                int(total_h * 0.50),
                 text="🫧",
-                fill="#ffffff",
+                fill=FOREGROUND_COLOR,
                 font=("Segoe UI Emoji", label_font, "bold"),
             )
 
             text_font = max(10, int(round(icon_size * 0.22)))
             self._text_item = self._canvas.create_text(
-                int(icon_size + text_gap),
-                int(icon_size * 0.50),
+                int(icon_size + self._text_gap),
+                int(total_h * 0.50),
                 text="",
                 anchor="w",
-                fill="#ffffff",
+                width=text_area,
+                fill=FOREGROUND_COLOR,
                 font=("Segoe UI", text_font, "bold"),
             )
 
-            self._root.geometry(f"{total_w}x{total_h}+{x}+{y}")
+            self._root.geometry(f"{self._total_w}x{total_h}+{x}+{y}")
             self._root.withdraw()
             self._ready.set()
             self._root.mainloop()

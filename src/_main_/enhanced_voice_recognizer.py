@@ -22,6 +22,8 @@ COMMON_STT_FIXES = {
     "switch toe tab": "switch to tab",
     "switch two tab": "switch to tab",
     "go too tab": "go to tab",
+    "goto": "go to",
+    "go-to": "go to",
     "opun": "open",
     "clik": "click",
     "opened": "open",
