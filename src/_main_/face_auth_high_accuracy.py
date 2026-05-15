@@ -3,6 +3,9 @@ import numpy as np
 import time
 import os
 import glob
+import re
+import shutil
+import urllib.request
 from collections import deque
 
 # ---------- User settings ----------
@@ -10,6 +13,31 @@ AUTHORIZED_IMAGES_FOLDER = "known_faces"
 CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
+
+# Modern OpenCV DNN face authentication.
+# YuNet detects faces and landmarks; SFace creates face embeddings for fast matching.
+DNN_MODEL_FOLDER = "models/face_auth"
+YUNET_MODEL_NAME = "face_detection_yunet_2023mar.onnx"
+SFACE_MODEL_NAME = "face_recognition_sface_2021dec.onnx"
+YUNET_MODEL_URL = (
+    "https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/"
+    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
+SFACE_MODEL_URL = (
+    "https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/"
+    "face_recognition_sface/face_recognition_sface_2021dec.onnx"
+)
+AUTO_DOWNLOAD_DNN_MODELS = True
+DNN_DOWNLOAD_TIMEOUT = 25
+DNN_DETECTION_SCORE_THRESHOLD = 0.88
+DNN_NMS_THRESHOLD = 0.30
+DNN_TOP_K = 5000
+
+# SFace cosine similarity: higher is better. OpenCV's public LFW threshold is 0.363;
+# authentication uses a stricter value to reduce false accepts.
+SFACE_COSINE_THRESHOLD = 0.42
+SFACE_STRONG_COSINE_THRESHOLD = 0.50
+SFACE_SOFT_FAIL_MARGIN = 0.05
 
 # LBPH thresholds (lower confidence is better)
 LBPH_CONFIDENCE_MAX = 62.0
@@ -57,11 +85,30 @@ def _resolve_authorized_images_folder(folder_candidate):
     return candidates[0]
 
 
+def _resolve_model_folder(folder_candidate):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.isabs(folder_candidate):
+        return folder_candidate
+
+    return os.path.join(os.path.dirname(script_dir), folder_candidate)
+
+
+def _identity_name_from_path(path):
+    name = os.path.splitext(os.path.basename(path))[0].lower()
+    # face_auth_register.py saves name_01.jpg, name_02.jpg, etc.
+    return re.sub(r"[_-]\d+$", "", name)
+
+
+def _rect_from_dnn_face(face_row):
+    x, y, w, h = [int(round(v)) for v in face_row[:4]]
+    return (x, y, w, h)
+
+
 class FaceAuthenticatorHighAccuracy:
     """
-    High-reliability face authenticator using two-stage verification:
-    1) LBPH identity prediction
-    2) ORB feature consistency check on predicted identity
+    High-reliability face authenticator using the best available local backend:
+    1) OpenCV DNN YuNet + SFace embeddings when ONNX models are available
+    2) LBPH + ORB fallback when DNN models are unavailable
 
     Notes:
     - No vision system can guarantee 100% accuracy in real-world conditions.
@@ -100,11 +147,80 @@ class FaceAuthenticatorHighAccuracy:
         self.identity_labels = []
         self.identity_name_by_label = {}
         self.auth_descriptors_by_label = {}
+        self.sface_features_by_label = {}
+        self.dnn_enabled = False
+        self.dnn_status = "not initialized"
+        self.dnn_detector = None
+        self.sface = None
 
         folder_candidate = authorized_images_folder or AUTHORIZED_IMAGES_FOLDER
         self.authorized_images_folder = _resolve_authorized_images_folder(folder_candidate)
+        self.model_folder = _resolve_model_folder(DNN_MODEL_FOLDER)
 
+        self._init_dnn_backend()
         self._load_and_train()
+
+    def _model_path(self, model_name):
+        return os.path.join(self.model_folder, model_name)
+
+    def _ensure_model_file(self, model_name, url):
+        path = self._model_path(model_name)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+
+        if not AUTO_DOWNLOAD_DNN_MODELS:
+            return None
+
+        os.makedirs(self.model_folder, exist_ok=True)
+        tmp_path = path + ".download"
+        try:
+            print(f"[FACE AUTH HA] Downloading {model_name}...")
+            with urllib.request.urlopen(url, timeout=DNN_DOWNLOAD_TIMEOUT) as response:
+                with open(tmp_path, "wb") as tmp_file:
+                    shutil.copyfileobj(response, tmp_file)
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                raise RuntimeError("downloaded file is empty")
+            os.replace(tmp_path, path)
+            return path
+        except Exception as e:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            print(f"[FACE AUTH HA] Could not download {model_name}: {e}")
+            return None
+
+    def _init_dnn_backend(self):
+        if not hasattr(cv2, "FaceDetectorYN_create") or not hasattr(cv2, "FaceRecognizerSF_create"):
+            self.dnn_status = "OpenCV DNN face APIs unavailable"
+            print(f"[FACE AUTH HA] {self.dnn_status}; using LBPH+ORB fallback.")
+            return
+
+        yunet_path = self._ensure_model_file(YUNET_MODEL_NAME, YUNET_MODEL_URL)
+        sface_path = self._ensure_model_file(SFACE_MODEL_NAME, SFACE_MODEL_URL)
+        if not yunet_path or not sface_path:
+            self.dnn_status = "DNN model files unavailable"
+            print(f"[FACE AUTH HA] {self.dnn_status}; using LBPH+ORB fallback.")
+            return
+
+        try:
+            self.dnn_detector = cv2.FaceDetectorYN_create(
+                yunet_path,
+                "",
+                (FRAME_WIDTH, FRAME_HEIGHT),
+                DNN_DETECTION_SCORE_THRESHOLD,
+                DNN_NMS_THRESHOLD,
+                DNN_TOP_K,
+            )
+            self.sface = cv2.FaceRecognizerSF_create(sface_path, "")
+            self.dnn_enabled = True
+            self.dnn_status = "YuNet+SFace"
+            print("[FACE AUTH HA] Modern DNN backend enabled: YuNet+SFace.")
+        except Exception as e:
+            self.dnn_enabled = False
+            self.dnn_status = f"DNN init failed: {e}"
+            print(f"[FACE AUTH HA] {self.dnn_status}; using LBPH+ORB fallback.")
 
     def _enhance_gray(self, gray):
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -131,6 +247,24 @@ class FaceAuthenticatorHighAccuracy:
         )
         return faces
 
+    def _detect_faces_dnn(self, frame):
+        if not self.dnn_enabled or self.dnn_detector is None:
+            return None
+
+        h, w = frame.shape[:2]
+        self.dnn_detector.setInputSize((w, h))
+        try:
+            _, faces = self.dnn_detector.detect(frame)
+        except Exception:
+            return None
+
+        if faces is None or len(faces) == 0:
+            return np.empty((0, 4), dtype=np.int32), []
+
+        face_rows = sorted(faces, key=lambda r: float(r[2] * r[3]), reverse=True)
+        rects = np.array([_rect_from_dnn_face(row) for row in face_rows], dtype=np.int32)
+        return rects, face_rows
+
     def _extract_face_from_image(self, path):
         img = cv2.imread(path)
         if img is None:
@@ -149,6 +283,28 @@ class FaceAuthenticatorHighAccuracy:
         face = cv2.resize(face, (200, 200))
         face = self._enhance_gray(face)
         return face
+
+    def _extract_dnn_feature_from_image(self, path):
+        if not self.dnn_enabled or self.sface is None:
+            return None
+
+        img = cv2.imread(path)
+        if img is None:
+            raise FileNotFoundError(f"Image not found at: {path}")
+
+        detection = self._detect_faces_dnn(img)
+        if detection is None:
+            return None
+        _, face_rows = detection
+        if not face_rows:
+            return None
+
+        try:
+            aligned = self.sface.alignCrop(img, np.asarray(face_rows[0], dtype=np.float32))
+            feature = self.sface.feature(aligned)
+            return feature.copy()
+        except Exception:
+            return None
 
     def _augment_face(self, face):
         # Small augmentations improve recognition robustness from limited samples.
@@ -198,6 +354,7 @@ class FaceAuthenticatorHighAccuracy:
         self.identity_labels.clear()
         self.identity_name_by_label = {}
         self.auth_descriptors_by_label = {}
+        self.sface_features_by_label = {}
 
         if not os.path.exists(self.authorized_images_folder):
             print(f"[ERROR] Authorized images folder not found at: {self.authorized_images_folder}")
@@ -224,14 +381,19 @@ class FaceAuthenticatorHighAccuracy:
                     print(f"[WARNING] No face extracted from: {os.path.basename(path)}")
                     continue
 
-                identity_name = os.path.splitext(os.path.basename(path))[0].lower()
+                identity_name = _identity_name_from_path(path)
                 if identity_name not in label_by_identity:
                     new_label = len(label_by_identity)
                     label_by_identity[identity_name] = new_label
                     self.identity_name_by_label[new_label] = identity_name
                     self.auth_descriptors_by_label[new_label] = []
+                    self.sface_features_by_label[new_label] = []
 
                 label = label_by_identity[identity_name]
+                dnn_feature = self._extract_dnn_feature_from_image(path)
+                if dnn_feature is not None:
+                    self.sface_features_by_label[label].append(dnn_feature)
+
                 variants = self._augment_face(face)
 
                 for v in variants:
@@ -255,7 +417,10 @@ class FaceAuthenticatorHighAccuracy:
             self.lbph.train(train_images, labels_np)
 
         if loaded > 0:
-            mode = "LBPH+ORB" if self.lbph_enabled else "ORB-only"
+            if self.dnn_enabled and any(self.sface_features_by_label.values()):
+                mode = "YuNet+SFace with LBPH+ORB fallback"
+            else:
+                mode = "LBPH+ORB" if self.lbph_enabled else "ORB-only"
             print(f"[FACE AUTH HA] Trained with {loaded} identity images ({mode}).")
         else:
             print("[ERROR] No valid authorized face images loaded.")
@@ -283,11 +448,94 @@ class FaceAuthenticatorHighAccuracy:
 
         return best_good, best_ratio
 
+    def _match_sface_feature(self, live_feature):
+        if live_feature is None or self.sface is None:
+            return None, -1.0
+
+        best_label = None
+        best_score = -1.0
+        for label, features in self.sface_features_by_label.items():
+            for auth_feature in features:
+                try:
+                    score = float(self.sface.match(
+                        auth_feature,
+                        live_feature,
+                        cv2.FaceRecognizerSF_FR_COSINE,
+                    ))
+                except Exception:
+                    continue
+                if score > best_score:
+                    best_score = score
+                    best_label = label
+
+        return best_label, best_score
+
+    def _authenticate_frame_dnn(self, frame, face_rows, current_time):
+        if not face_rows or self.sface is None or not any(self.sface_features_by_label.values()):
+            return False
+
+        try:
+            face_row = np.asarray(face_rows[0], dtype=np.float32)
+            aligned = self.sface.alignCrop(frame, face_row)
+            live_feature = self.sface.feature(aligned)
+        except Exception as e:
+            self.last_match_result = f"DNN align/feature failed: {e}"
+            self.last_match_time = current_time
+            self.last_check_time = current_time
+            return False
+
+        predicted_label, score = self._match_sface_feature(live_feature)
+        final_match = score >= SFACE_COSINE_THRESHOLD
+        strong_match = score >= SFACE_STRONG_COSINE_THRESHOLD
+        soft_fail = self.authorized and (not final_match) and score >= (SFACE_COSINE_THRESHOLD - SFACE_SOFT_FAIL_MARGIN)
+
+        if final_match:
+            self.recent_decisions.append(1.0)
+        elif soft_fail:
+            self.recent_decisions.append(0.5)
+        else:
+            self.recent_decisions.append(0.0)
+
+        pass_ratio = float(sum(self.recent_decisions) / len(self.recent_decisions))
+        stable_pass = pass_ratio >= PASS_RATIO_THRESHOLD
+        stable_fail = pass_ratio <= (1.0 - FAIL_RATIO_THRESHOLD)
+
+        if final_match:
+            self.success_streak += 1
+            self.fail_streak = 0
+            required_successes = 1 if strong_match else SUCCESS_STREAK_REQUIRED
+            if self.success_streak >= required_successes and stable_pass and not self.authorized:
+                self.authorized = True
+                print("[FACE AUTH HA] Authorized - Gesture control ENABLED")
+        elif soft_fail:
+            self.success_streak = max(0, self.success_streak - 1)
+        else:
+            self.fail_streak += 1
+            self.success_streak = 0
+            required_fails = AUTHORIZED_FAIL_STREAK_REQUIRED if self.authorized else FAIL_STREAK_REQUIRED
+            if self.fail_streak >= required_fails and stable_fail and self.authorized:
+                self.authorized = False
+                print("[FACE AUTH HA] Unauthorized - Gesture control DISABLED")
+
+        identity = self.identity_name_by_label.get(predicted_label, "unknown")
+        self.last_match_result = (
+            f"id={identity} sface={score:.3f} "
+            f"final={'MATCH' if final_match else ('SOFT_FAIL' if soft_fail else 'NO_MATCH')} pass={pass_ratio:.2f}"
+        )
+        self.last_match_time = current_time
+        self.last_check_time = current_time
+        return True
+
     def authenticate_frame(self, frame):
         current_time = time.time()
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self._detect_faces(gray)
+        dnn_face_rows = []
+        dnn_detection = self._detect_faces_dnn(frame)
+        if dnn_detection is not None:
+            faces, dnn_face_rows = dnn_detection
+        else:
+            faces = self._detect_faces(gray)
         face_detected = len(faces) > 0
 
         if face_detected:
@@ -307,12 +555,16 @@ class FaceAuthenticatorHighAccuracy:
 
         can_check = (
             face_detected
-            and len(self.auth_descriptors) > 0
+            and (len(self.auth_descriptors) > 0 or any(self.sface_features_by_label.values()))
             and time_since_last_check >= check_interval
             and face_detected_duration >= MIN_FACE_TIME
         )
 
         if can_check:
+            if self.dnn_enabled and dnn_face_rows and any(self.sface_features_by_label.values()):
+                if self._authenticate_frame_dnn(frame, dnn_face_rows, current_time):
+                    return face_detected, faces
+
             x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
             face_roi = gray[y:y + h, x:x + w]
             if face_roi.size == 0:
